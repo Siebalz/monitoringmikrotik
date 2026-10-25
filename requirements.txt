@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+itsdangerous>=2.1
+cryptography>=42
+requests>=2.31

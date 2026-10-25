@@ -1,0 +1,13 @@
+services:
+  monitor:
+    build: .
+    container_name: mikrotik-monitor
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "3500:8080"      # ganti ke "127.0.0.1:8080:8080" bila dipasang di belakang reverse proxy
+    volumes:
+      - ./data:/data
+    # Penting: container harus bisa menjangkau IP VPN router.
+    # Jika VPN berjalan di host (WireGuard/OpenVPN/L2TP), jaringan bridge Docker default sudah
+    # di-NAT lewat host sehingga biasanya cukup. Bila tidak, pakai: network_mode: host
