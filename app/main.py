@@ -1,4 +1,4 @@
-import json, time, threading, logging, hmac, os
+import json, time, threading, logging, hmac, os, re
 from contextlib import asynccontextmanager
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException, Depends
@@ -8,8 +8,8 @@ from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import db, poller, ros, telegram as tg, demo, vpn, diag, latency
-from .config import ADMIN_USER, ADMIN_PASSWORD, SECRET_KEY, DEMO
-from .security import enc, dec
+from .config import ADMIN_USER, ADMIN_PASSWORD, SECRET_KEY, DEMO, COOKIE_SECURE
+from .security import enc, dec, hash_password, verify_password, _DUMMY
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -30,13 +30,65 @@ async def lifespan(app):
 
 
 app = FastAPI(title="MikroTik Monitor", lifespan=lifespan)
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=14 * 86400, same_site="lax", https_only=False)
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=14 * 86400, same_site="lax", https_only=COOKIE_SECURE)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
-def auth(request: Request):
-    if not request.session.get("u"):
+def _ctx(request: Request):
+    """Identitas sesi. Admin = akun .env (akses penuh); client = akun portal klien (baca-saja, hanya router miliknya)."""
+    u = request.session.get("u")
+    if not u:
         raise HTTPException(401, "Belum login")
+    if (request.session.get("role") or "admin") == "client":
+        row = db.q1("SELECT id, username, display_name, enabled FROM users WHERE id=? AND role='client'", (request.session.get("uid"),))
+        if not row or not row["enabled"]:          # dinonaktifkan/dihapus -> langsung tertendang
+            request.session.clear()
+            raise HTTPException(401, "Akun tidak aktif")
+        return {"role": "client", "uid": row["id"], "username": row["username"], "name": row["display_name"] or row["username"]}
+    return {"role": "admin", "uid": None, "username": u, "name": u}
+
+
+def auth(request: Request):
+    """Default semua endpoint: HANYA admin."""
+    if _ctx(request)["role"] != "admin":
+        raise HTTPException(403, "Hanya untuk admin")
+
+
+def auth_any(request: Request):
+    """Admin atau klien (dipakai khusus endpoint baca-saja yang disaring per klien)."""
+    return _ctx(request)
+
+
+def scope(request: Request):
+    """None = admin (semua router); list id router untuk klien."""
+    c = _ctx(request)
+    if c["role"] == "admin":
+        return None
+    return [r["router_id"] for r in db.q("SELECT router_id FROM user_routers WHERE user_id=?", (c["uid"],))]
+
+
+def _check(request: Request, rid: int):
+    sc = scope(request)
+    if sc is not None and rid not in sc:
+        raise HTTPException(404, "Router tidak ditemukan")      # 404, bukan 403: tidak membocorkan keberadaan router lain
+
+
+def _in(ids):
+    return "(" + (",".join("?" * len(ids)) or "NULL") + ")"
+
+
+_CLIENT_HIDE = ("host", "port", "username", "use_ssl", "has_password", "notes", "wan_iface")
+
+
+def _client_view(r):
+    """Sembunyikan detail koneksi/internal dari klien."""
+    r = dict(r)
+    for k in _CLIENT_HIDE:
+        r.pop(k, None)
+    r["host"] = ""
+    if "last_error" in r:
+        r["last_error"] = ""
+    return r
 
 
 _fails = {}
@@ -53,13 +105,25 @@ def login(body: LoginIn, request: Request):
     f = _fails.get(ip, (0, 0))
     if f[0] >= 5 and time.time() - f[1] < 60:
         raise HTTPException(429, "Terlalu banyak percobaan. Coba lagi 1 menit.")
-    ok = hmac.compare_digest(body.username, ADMIN_USER) & hmac.compare_digest(body.password, ADMIN_PASSWORD)
-    if not ok:
+    uname = body.username.strip()
+    role, uid = None, None
+    if hmac.compare_digest(uname.encode(), ADMIN_USER.encode()) & hmac.compare_digest(body.password.encode(), ADMIN_PASSWORD.encode()):
+        role = "admin"
+    else:
+        u = db.q1("SELECT * FROM users WHERE username=? AND role='client'", (uname,))
+        good = verify_password(body.password, u["password_hash"] if u else _DUMMY)      # waktu sama walau user tak ada
+        if u and good and u["enabled"]:
+            role, uid = "client", u["id"]
+    if not role:
         _fails[ip] = (f[0] + 1 if time.time() - f[1] < 60 else 1, time.time())
         raise HTTPException(401, "Username atau password salah")
     _fails.pop(ip, None)
-    request.session["u"] = body.username
-    return {"ok": True}
+    request.session.clear()
+    request.session["u"], request.session["role"] = uname, role
+    if uid:
+        request.session["uid"] = uid
+        db.ex("UPDATE users SET last_login=? WHERE id=?", (int(time.time()), uid))
+    return {"ok": True, "role": role}
 
 
 @app.post("/api/logout")
@@ -70,7 +134,12 @@ def logout(request: Request):
 
 @app.get("/api/me")
 def me(request: Request):
-    return {"user": request.session.get("u"), "demo": DEMO}
+    brand = db.get_settings()["brand_name"]
+    try:
+        c = _ctx(request)
+    except HTTPException:
+        return {"user": None, "demo": DEMO, "brand": brand}
+    return {"user": c["username"], "name": c["name"], "role": c["role"], "demo": DEMO, "brand": brand}
 
 
 @app.get("/")
@@ -107,13 +176,18 @@ def _load(rid):
 
 
 # ------------------------------------------------------------------ overview
-@app.get("/api/overview", dependencies=[Depends(auth)])
-def overview():
+@app.get("/api/overview", dependencies=[Depends(auth_any)])
+def overview(request: Request):
+    sc = scope(request)
     now = int(time.time())
     rows = db.q("""SELECT r.*, s.online, s.fail_count, s.last_ok, s.last_poll, s.last_error, s.down_since, s.info, s.latest
                    FROM routers r LEFT JOIN router_state s ON s.router_id=r.id ORDER BY r.name""")
+    if sc is not None:
+        rows = [r for r in rows if r["id"] in sc]
     alerts = db.q("""SELECT a.router_id, a.key, a.level, a.since, a.message, r.name router_name
                      FROM alert_state a JOIN routers r ON r.id=a.router_id ORDER BY a.level='critical' DESC, a.since DESC""")
+    if sc is not None:
+        alerts = [a for a in alerts if a["router_id"] in sc]
     by_r = {}
     for a in alerts:
         by_r.setdefault(a["router_id"], []).append(a)
@@ -127,6 +201,8 @@ def overview():
         info = json.loads(r.pop("info") or "{}")
         lt.pop("ifaces", None)
         r = _router_public(r)
+        if sc is not None:
+            r = _client_view(r)
         r.update(latest=lt, info=info, alerts=by_r.get(r["id"], []), spark=spark.get(r["id"], []))
         if r["enabled"] and r["online"]:
             tot["rx"] += lt.get("rx_bps") or 0
@@ -142,24 +218,28 @@ def overview():
         "alerts": len(alerts), "rx_bps": tot["rx"], "tx_bps": tot["tx"], "dhcp": tot["clients"], "ppp": tot["ppp"],
         "avg_latency": sum(lats) / len(lats) if lats else None,
     }
-    ev = db.q("SELECT * FROM events ORDER BY id DESC LIMIT 10")
+    ev = db.q("SELECT * FROM events ORDER BY id DESC LIMIT 10") if sc is None else \
+        db.q(f"SELECT * FROM events WHERE router_id IN {_in(sc)} ORDER BY id DESC LIMIT 10", sc)
     return {"summary": summary, "routers": out, "alerts": alerts, "events": ev, "now": now,
             "poll_interval": db.get_settings()["poll_interval"]}
 
 
-@app.get("/api/fleet/traffic", dependencies=[Depends(auth)])
-def fleet_traffic(range: str = "6h"):
+@app.get("/api/fleet/traffic", dependencies=[Depends(auth_any)])
+def fleet_traffic(request: Request, range: str = "6h"):
+    sc = scope(request)
     sec, b = _range(range)
     b = max(b, 60)
-    rows = db.q("""SELECT t, SUM(rx) rx, SUM(tx) tx, COUNT(*) n FROM (
+    flt, args = ("", []) if sc is None else (f" AND router_id IN {_in(sc)}", list(sc))
+    rows = db.q(f"""SELECT t, SUM(rx) rx, SUM(tx) tx, COUNT(*) n FROM (
                      SELECT router_id, (ts/?)*? t, AVG(rx_bps) rx, AVG(tx_bps) tx FROM metrics
-                     WHERE ts>=? AND online=1 GROUP BY router_id, t) GROUP BY t ORDER BY t""", (b, b, int(time.time()) - sec))
+                     WHERE ts>=? AND online=1{flt} GROUP BY router_id, t) GROUP BY t ORDER BY t""", [b, b, int(time.time()) - sec] + args)
     return {"bucket": b, "t": [r["t"] for r in rows], "rx": [r["rx"] for r in rows], "tx": [r["tx"] for r in rows]}
 
 
 # ------------------------------------------------------------------ router detail
-@app.get("/api/routers/{rid}", dependencies=[Depends(auth)])
-def router_detail(rid: int):
+@app.get("/api/routers/{rid}", dependencies=[Depends(auth_any)])
+def router_detail(rid: int, request: Request):
+    _check(request, rid)
     r = _load(rid)
     s = db.q1("SELECT * FROM router_state WHERE router_id=?", (rid,)) or {}
     now = int(time.time())
@@ -170,14 +250,20 @@ def router_detail(rid: int):
     watched = [x["name"] for x in db.q("SELECT name FROM watched_ifaces WHERE router_id=?", (rid,))]
     alerts = db.q("SELECT * FROM alert_state WHERE router_id=? ORDER BY since DESC", (rid,))
     events = db.q("SELECT * FROM events WHERE router_id=? ORDER BY id DESC LIMIT 15", (rid,))
-    return {"router": _router_public(r),
+    res = {"router": _router_public(r),
             "state": {k: s.get(k) for k in ("online", "fail_count", "last_ok", "last_poll", "last_error", "down_since")},
             "info": json.loads(s.get("info") or "{}"), "latest": json.loads(s.get("latest") or "{}"),
             "availability": av, "watched": watched, "alerts": alerts, "events": events, "now": now}
+    if scope(request) is not None:
+        res["router"] = _client_view(res["router"])
+        res["state"]["last_error"] = ""
+        res["watched"] = []
+    return res
 
 
-@app.get("/api/routers/{rid}/metrics", dependencies=[Depends(auth)])
-def router_metrics(rid: int, range: str = "1h"):
+@app.get("/api/routers/{rid}/metrics", dependencies=[Depends(auth_any)])
+def router_metrics(rid: int, request: Request, range: str = "1h"):
+    _check(request, rid)
     _load(rid)
     sec, b = _range(range)
     since = int(time.time()) - sec
@@ -196,8 +282,9 @@ def router_metrics(rid: int, range: str = "1h"):
     return d
 
 
-@app.get("/api/routers/{rid}/iface", dependencies=[Depends(auth)])
-def router_iface(rid: int, name: str, range: str = "1h"):
+@app.get("/api/routers/{rid}/iface", dependencies=[Depends(auth_any)])
+def router_iface(rid: int, request: Request, name: str, range: str = "1h"):
+    _check(request, rid)
     _load(rid)
     sec, b = _range(range)
     rows = db.q("""SELECT (ts/?)*? t, AVG(rx_bps) rx, AVG(tx_bps) tx FROM iface_metrics
@@ -280,6 +367,7 @@ def delete_router(rid: int):
     _load(rid)
     for t in ("routers", "router_state", "metrics", "iface_metrics", "alert_state", "watched_ifaces"):
         db.ex(f"DELETE FROM {t} WHERE {'id' if t == 'routers' else 'router_id'}=?", (rid,))
+    db.ex("DELETE FROM user_routers WHERE router_id=?", (rid,))
     return {"ok": True}
 
 
@@ -307,9 +395,13 @@ def test_router(b: TestIn):
 
 
 # ------------------------------------------------------------------ events
-@app.get("/api/events", dependencies=[Depends(auth)])
-def events(router_id: Optional[int] = None, level: Optional[str] = None, limit: int = 200):
+@app.get("/api/events", dependencies=[Depends(auth_any)])
+def events(request: Request, router_id: Optional[int] = None, level: Optional[str] = None, limit: int = 200):
+    sc = scope(request)
     sql, a = "SELECT * FROM events WHERE 1=1", []
+    if sc is not None:                                   # klien: hanya router miliknya, tanpa log audit admin
+        sql += f" AND router_id IN {_in(sc)} AND kind!='audit'"
+        a += list(sc)
     if router_id:
         sql += " AND router_id=?"
         a.append(router_id)
@@ -626,10 +718,14 @@ def _lat_view(rid, rng):
             "error": latency.get_error(rid)}
 
 
-@app.get("/api/routers/{rid}/latency", dependencies=[Depends(auth)])
-def router_latency(rid: int, range: str = "1h"):
+@app.get("/api/routers/{rid}/latency", dependencies=[Depends(auth_any)])
+def router_latency(rid: int, request: Request, range: str = "1h"):
+    _check(request, rid)
     _load(rid)
-    return _lat_view(rid, range)
+    v = _lat_view(rid, range)
+    if scope(request) is not None:
+        v["error"] = ""
+    return v
 
 
 @app.post("/api/routers/{rid}/latency/probe", dependencies=[Depends(auth)])
@@ -639,8 +735,9 @@ def router_latency_probe(rid: int):
     return {"measured": n, "error": latency.get_error(rid)}
 
 
-@app.get("/api/latency/overview", dependencies=[Depends(auth)])
-def latency_overview():
+@app.get("/api/latency/overview", dependencies=[Depends(auth_any)])
+def latency_overview(request: Request):
+    sc = scope(request)
     s = db.get_settings()
     tg = [n for n, _ in latency.targets_for(s)]
     now = int(time.time())
@@ -654,5 +751,213 @@ def latency_overview():
                  LEFT JOIN router_state s ON s.router_id=r.id ORDER BY r.name""")
     for r in rs:
         r["cells"] = cell.get(r["id"], {})
-        r["error"] = latency.get_error(r["id"])
+        r["error"] = latency.get_error(r["id"]) if sc is None else ""
+    if sc is not None:
+        rs = [r for r in rs if r["id"] in sc]
     return {"targets": tg, "routers": rs, "warn": s["latency_warn"], "bad": s["latency_bad"], "enabled": s["latency_enabled"], "now": now}
+
+
+@app.get("/api/routers/{rid}/latency/live", dependencies=[Depends(auth)])
+def router_latency_live(rid: int, since: int = 0):
+    r = _load(rid)
+    try:
+        ss = latency.get_live(r)
+    except latency.LiveBusy as e:
+        raise HTTPException(429, str(e))
+    st = db.get_settings()
+    return {"targets": ss.snapshot(since), "error": ss.err, "warn": st["latency_warn"], "bad": st["latency_bad"], "now": int(time.time() * 1000)}
+
+
+# ------------------------------------------------------------------ akun klien (portal)
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.@-]{3,40}$")
+CHAT_RE = re.compile(r"^-?\d{5,20}$")
+NOTIFY_OPTS = ("all", "down", "off")
+
+
+def _norm_chats(s):
+    ids = [x.strip() for x in (s or "").replace(";", ",").split(",") if x.strip()]
+    for i in ids:
+        if not CHAT_RE.match(i):
+            raise HTTPException(400, f"Chat ID Telegram tidak valid: '{i}' (hanya angka, boleh diawali minus)")
+    return ",".join(dict.fromkeys(ids))
+
+
+def _user_row(u):
+    ids = [r["router_id"] for r in db.q("SELECT router_id FROM user_routers WHERE user_id=?", (u["id"],))]
+    return {"id": u["id"], "username": u["username"], "display_name": u["display_name"], "enabled": bool(u["enabled"]),
+            "tg_chat_ids": u["tg_chat_ids"], "notify": u["notify"], "last_login": u["last_login"], "created_at": u["created_at"],
+            "router_ids": ids}
+
+
+class UserIn(BaseModel):
+    username: str
+    display_name: str = ""
+    password: Optional[str] = None
+    enabled: bool = True
+    tg_chat_ids: str = ""
+    notify: str = "all"
+    router_ids: list[int] = []
+
+
+def _check_user_in(b: UserIn):
+    if b.notify not in NOTIFY_OPTS:
+        raise HTTPException(400, "Pilihan notifikasi tidak valid")
+    ids = list(dict.fromkeys(b.router_ids))
+    if ids:
+        have = {r["id"] for r in db.q(f"SELECT id FROM routers WHERE id IN {_in(ids)}", ids)}
+        if set(ids) - have:
+            raise HTTPException(400, "Ada router yang tidak ditemukan")
+    return ids, _norm_chats(b.tg_chat_ids)
+
+
+def _set_links(uid, ids):
+    db.ex("DELETE FROM user_routers WHERE user_id=?", (uid,))
+    if ids:
+        c = db.conn()
+        c.executemany("INSERT INTO user_routers(user_id,router_id) VALUES(?,?)", [(uid, i) for i in ids])
+        c.commit()
+
+
+@app.get("/api/users", dependencies=[Depends(auth)])
+def users_list():
+    return [_user_row(u) for u in db.q("SELECT * FROM users WHERE role='client' ORDER BY username")]
+
+
+@app.post("/api/users", dependencies=[Depends(auth)])
+def users_add(b: UserIn, request: Request):
+    uname = b.username.strip()
+    if not USERNAME_RE.match(uname):
+        raise HTTPException(400, "Username 3–40 karakter: huruf, angka, titik, minus, underscore, @")
+    if uname.lower() == ADMIN_USER.lower() or db.q1("SELECT 1 FROM users WHERE username=?", (uname,)):
+        raise HTTPException(400, "Username sudah dipakai")
+    if b.password is not None and b.password != "" and len(b.password) < 8:
+        raise HTTPException(400, "Password minimal 8 karakter")
+    ids, chats = _check_user_in(b)
+    pw = b.password or vpn.gen_password(14)
+    cur = db.ex("""INSERT INTO users(username,display_name,password_hash,role,enabled,tg_chat_ids,notify,created_at)
+                   VALUES(?,?,?,'client',?,?,?,?)""",
+                (uname, b.display_name.strip()[:80], hash_password(pw), int(b.enabled), chats, b.notify, int(time.time())))
+    _set_links(cur.lastrowid, ids)
+    _audit(request, f"Akun klien dibuat: {uname} ({len(ids)} router)")
+    return {"id": cur.lastrowid, "username": uname, "password": pw}
+
+
+@app.put("/api/users/{uid}", dependencies=[Depends(auth)])
+def users_update(uid: int, b: UserIn, request: Request):
+    u = db.q1("SELECT * FROM users WHERE id=? AND role='client'", (uid,))
+    if not u:
+        raise HTTPException(404, "Akun tidak ditemukan")
+    uname = b.username.strip()
+    if not USERNAME_RE.match(uname):
+        raise HTTPException(400, "Username tidak valid")
+    if uname.lower() == ADMIN_USER.lower() or db.q1("SELECT 1 FROM users WHERE username=? AND id!=?", (uname, uid)):
+        raise HTTPException(400, "Username sudah dipakai")
+    ids, chats = _check_user_in(b)
+    pw_new = None
+    if b.password:
+        if len(b.password) < 8:
+            raise HTTPException(400, "Password minimal 8 karakter")
+        pw_new = b.password
+    db.ex("UPDATE users SET username=?, display_name=?, enabled=?, tg_chat_ids=?, notify=? WHERE id=?",
+          (uname, b.display_name.strip()[:80], int(b.enabled), chats, b.notify, uid))
+    if pw_new:
+        db.ex("UPDATE users SET password_hash=? WHERE id=?", (hash_password(pw_new), uid))
+    _set_links(uid, ids)
+    _audit(request, f"Akun klien diubah: {uname}" + (" (password direset)" if pw_new else "") + ("" if b.enabled else " (dinonaktifkan)"))
+    return {"ok": True}
+
+
+@app.delete("/api/users/{uid}", dependencies=[Depends(auth)])
+def users_delete(uid: int, request: Request):
+    u = db.q1("SELECT * FROM users WHERE id=? AND role='client'", (uid,))
+    if not u:
+        raise HTTPException(404, "Akun tidak ditemukan")
+    db.ex("DELETE FROM user_routers WHERE user_id=?", (uid,))
+    db.ex("DELETE FROM users WHERE id=?", (uid,))
+    _audit(request, f"Akun klien dihapus: {u['username']}")
+    return {"ok": True}
+
+
+@app.post("/api/users/{uid}/test-notify", dependencies=[Depends(auth)])
+def users_test_notify(uid: int):
+    u = db.q1("SELECT * FROM users WHERE id=? AND role='client'", (uid,))
+    if not u:
+        raise HTTPException(404, "Akun tidak ditemukan")
+    ids = [x for x in u["tg_chat_ids"].split(",") if x]
+    if not ids:
+        raise HTTPException(400, "Akun ini belum mengisi Chat ID Telegram")
+    ok, err = tg.send(f"✅ <b>Tes notifikasi</b>\nHalo {tg.esc(u['display_name'] or u['username'])}, notifikasi untuk router Anda sudah aktif.", chat_ids=ids)
+    return {"ok": ok, "error": err}
+
+
+# ---- klien: profil sendiri
+def _client_only(request: Request):
+    c = _ctx(request)
+    if c["role"] != "client":
+        raise HTTPException(403, "Hanya untuk akun klien (admin diatur lewat .env)")
+    return c
+
+
+class ProfileIn(BaseModel):
+    tg_chat_ids: str = ""
+    notify: str = "all"
+
+
+class PasswordIn(BaseModel):
+    current: str
+    new: str
+
+
+@app.get("/api/me/profile")
+def my_profile(request: Request):
+    c = _client_only(request)
+    u = db.q1("SELECT * FROM users WHERE id=?", (c["uid"],))
+    s = db.get_settings()
+    return {"username": u["username"], "display_name": u["display_name"], "tg_chat_ids": u["tg_chat_ids"], "notify": u["notify"],
+            "telegram_ready": bool(s["tg_enabled"] and s["tg_token"])}
+
+
+@app.put("/api/me/profile")
+def my_profile_save(b: ProfileIn, request: Request):
+    c = _client_only(request)
+    if b.notify not in NOTIFY_OPTS:
+        raise HTTPException(400, "Pilihan notifikasi tidak valid")
+    db.ex("UPDATE users SET tg_chat_ids=?, notify=? WHERE id=?", (_norm_chats(b.tg_chat_ids), b.notify, c["uid"]))
+    return {"ok": True}
+
+
+@app.put("/api/me/password")
+def my_password(b: PasswordIn, request: Request):
+    c = _client_only(request)
+    u = db.q1("SELECT * FROM users WHERE id=?", (c["uid"],))
+    if not verify_password(b.current, u["password_hash"]):
+        raise HTTPException(400, "Password saat ini salah")
+    if len(b.new) < 8:
+        raise HTTPException(400, "Password baru minimal 8 karakter")
+    db.ex("UPDATE users SET password_hash=? WHERE id=?", (hash_password(b.new), c["uid"]))
+    return {"ok": True}
+
+
+@app.post("/api/me/test-notify")
+def my_test_notify(request: Request):
+    c = _client_only(request)
+    u = db.q1("SELECT * FROM users WHERE id=?", (c["uid"],))
+    ids = [x for x in u["tg_chat_ids"].split(",") if x]
+    if not ids:
+        raise HTTPException(400, "Isi dan simpan Chat ID Telegram dulu")
+    ok, err = tg.send("✅ <b>Tes notifikasi</b>\nNotifikasi untuk router Anda sudah aktif.", chat_ids=ids)
+    return {"ok": ok, "error": err}
+
+
+# ------------------------------------------------------------------ endpoint kecil yang aman untuk klien
+@app.get("/api/thresholds", dependencies=[Depends(auth_any)])
+def thresholds():
+    s = db.get_settings()
+    return {k: s[k] for k in ("cpu_limit", "mem_limit", "temp_limit", "latency_limit")}
+
+
+@app.get("/api/my/routers", dependencies=[Depends(auth_any)])
+def my_routers(request: Request):
+    sc = scope(request)
+    rows = db.q("SELECT id, name, group_name FROM routers ORDER BY name")
+    return rows if sc is None else [r for r in rows if r["id"] in sc]

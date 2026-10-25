@@ -11,6 +11,25 @@ Server ini menarik data lewat **RouterOS API** ke IP VPN tiap router (tanpa agen
 - Bot Telegram interaktif: `/status`, `/routers`, `/router <nama>`, `/alerts`, `/id`
 - Password router disimpan terenkripsi (Fernet); login admin; semua data di SQLite (`data/monitor.db`)
 
+## Portal klien (untuk jasa NOC / setting)
+
+Buat akun untuk pelanggan di menu **Klien**. Tiap klien login ke alamat web yang sama, tetapi:
+
+- hanya melihat **router yang Anda tautkan** ke akunnya (dashboard, grafik, latency, riwayat alert) — **baca-saja**
+- tidak melihat IP/host, username API, catatan internal, error teknis, menu VPN, Router, Pengaturan, maupun klien lain
+- tidak bisa mengubah apa pun, menjalankan ping/traceroute, atau mem-poll router (semua endpoint tulis tetap khusus admin dan dicek di server, bukan hanya disembunyikan di tampilan)
+- membuka router milik klien lain mendapat "tidak ditemukan"
+- bila akun dinonaktifkan/dihapus, sesi yang sedang login langsung tertendang
+
+**Notifikasi Telegram per klien:** isi Chat ID klien (atau klien mengisi sendiri di menu **Akun saya**: buka bot, kirim `/id`, salin angkanya). Klien menerima alert **hanya untuk router miliknya**, dengan pilihan *Semua kejadian*, *Hanya router mati/hidup*, atau *Mati*. Pesan ke klien otomatis tanpa IP dan tanpa detail error teknis. Bot juga membalas `/status`, `/routers`, `/router <nama>` khusus router klien itu. Pakai tombol **Tes notifikasi** untuk memastikan terkirim.
+
+Alur singkat: Klien → Tambah klien → pilih router → salin kredensial yang tampil (hanya muncul sekali) → kirim ke pelanggan.
+
+**White-label:** nama yang tampil di sidebar, halaman login, dan judul tab bisa diganti di Pengaturan → Portal klien.
+
+> Karena klien login dari internet, jalankan di belakang HTTPS (Caddy/Nginx/Cloudflare Tunnel) lalu isi `COOKIE_SECURE=1` di `.env`. Password klien disimpan ter-hash (scrypt). Akun admin tetap dari `.env`.
+> Tes: `python tests/test_portal.py`
+
 ## Fitur VPN (digabung dari VPN Manager PHP)
 
 Menu **VPN** mengelola server MikroTik L2TP Anda lewat RouterOS API:
@@ -48,7 +67,9 @@ Tiap router otomatis mem-ping Google, YouTube, Mobile Legends, PUBG Mobile, Inst
 - Halaman **Latency**: matriks semua router × semua target dalam satu layar, cocok untuk melihat lokasi mana yang internetnya bermasalah
 - Tombol **Ukur sekarang** untuk satu siklus ping seketika
 
-Target, interval, ambang warna, dan retensi diatur di **Pengaturan → Network Latency**. Format target `Nama:host` dipisah koma.
+**Mode Live (1 detik):** tombol **● Live** di panel latency mem-ping semua target dari router itu tiap 1 detik selama halaman terbuka, dengan grafik 2 menit terakhir. Data live hanya di memori (tidak masuk database) dan berhenti sendiri bila halaman ditutup; maksimal 4 router di-live bersamaan. Tiap target memakai satu koneksi API, jadi live ≈ 7 koneksi ke router itu selama aktif.
+
+Target, interval (minimal 10 detik), ambang warna, dan retensi diatur di **Pengaturan → Network Latency**. Format target `Nama:host` dipisah koma.
 
 > Mobile Legends dan PUBG dipantau lewat domain situs resminya (`mobilelegends.com`, `pubgmobile.com`), bukan server game, karena alamat server game berbeda per region/event. Kalau Anda tahu IP/host server yang dipakai pemain, ganti di Pengaturan supaya angkanya mewakili ping in-game.
 > Gateway yang berupa interface (PPPoE/LTE) dilewati karena tidak punya IP untuk di-ping. Butuh policy `test` pada user monitor (lihat bagian Diagnosa).
@@ -139,4 +160,3 @@ app/static/      dashboard (Chart.js & font dibundel, jalan offline)
 ```
 Ide pengembangan: impor otomatis router dari `/ppp secret` server VPN MikroTik, SNMP untuk perangkat non-MikroTik, ringkasan harian ke Telegram.
 # webmonitoring
-# monitoringmikrotik

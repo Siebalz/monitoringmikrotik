@@ -36,10 +36,10 @@ def _raise_or_clear(r, key, cond, level, fire_msg, clear_msg, tg_fire, tg_clear,
             db.ex("INSERT OR REPLACE INTO alert_state(router_id,key,level,since,last_sent,message) VALUES(?,?,?,?,?,?)",
                   (rid, key, level, now, now, fire_msg))
             db.add_event(level, key.split(":")[0], fire_msg, rid, r["name"])
-            tg.send_async(tg_fire, settings=s)
+            tg.notify(r, key, tg_fire, s)
         elif row and s["repeat_minutes"] and now - row["last_sent"] >= s["repeat_minutes"] * 60:
             db.ex("UPDATE alert_state SET last_sent=? WHERE router_id=? AND key=?", (now, rid, key))
-            tg.send_async("🔁 <b>Masih aktif</b>\n" + tg_fire, settings=s)
+            tg.notify(r, key, "🔁 <b>Masih aktif</b>\n" + tg_fire, s)
     else:
         _cnt[ck] = 0
         if row and not hold:
@@ -47,7 +47,7 @@ def _raise_or_clear(r, key, cond, level, fire_msg, clear_msg, tg_fire, tg_clear,
             dur = tg.fmt_dur(now - row["since"])
             db.add_event("ok", key.split(":")[0] + "_ok", f"{clear_msg} (selama {dur})", rid, r["name"])
             if s["notify_recovery"]:
-                tg.send_async(tg_clear.replace("{dur}", dur), settings=s)
+                tg.notify(r, key, tg_clear.replace("{dur}", dur), s)
 
 
 def _clear_all(r):
@@ -76,7 +76,7 @@ def evaluate(r, st, d, s, info_changed_reboot):
     # ---- reboot
     if info_changed_reboot and s["notify_reboot"]:
         db.add_event("info", "reboot", "Router reboot (uptime reset)", r["id"], r["name"])
-        tg.send_async(f"🔄 <b>ROUTER REBOOT</b>\n{head}\nUptime sekarang {tg.fmt_dur(d['uptime'])}", settings=s)
+        tg.notify(r, "reboot", f"🔄 <b>ROUTER REBOOT</b>\n{head}\nUptime sekarang {tg.fmt_dur(d['uptime'])}", s)
 
     def lim(k):
         v = r.get(k)

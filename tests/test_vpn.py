@@ -117,6 +117,31 @@ with TestClient(main.app) as c:
     assert c.get("/api/routers/99999/latency").status_code == 404
     c.put("/api/settings", json={"latency_gateway": False})
     assert "Gateway" not in [t["name"] for t in c.get(f"/api/routers/{rid2}/latency").json()["targets"]]
+    # --- mode live (1 detik) ---
+    import time as _t
+    c.put("/api/settings", json={"latency_gateway": True})
+    j1 = c.get(f"/api/routers/{rid2}/latency/live").json()
+    _t.sleep(3.3)
+    j2 = c.get(f"/api/routers/{rid2}/latency/live?since=0").json()
+    tg = {x["name"]: x for x in j2["targets"]}
+    assert set(tg) == {"Google", "PUBG Mobile", "Rusak", "Gateway"}, tg.keys()
+    g = tg["Google"]["pts"]
+    assert len(g) >= 3 and all(abs(p[1] - 10.5) < 1.5 for p in g), g                     # ~1 titik/detik, waktu terbaca
+    assert 900 <= g[1][0] - g[0][0] <= 1300, [p[0] for p in g]                              # selang ~1 detik
+    assert tg["Google"]["ip"] == "142.250.1.1" and tg["Gateway"]["pts"], tg["Gateway"]
+    assert tg["PUBG Mobile"]["pts"] and all(p[1] is None for p in tg["PUBG Mobile"]["pts"])  # 100% loss -> null
+    last = g[-1][0]
+    j3 = c.get(f"/api/routers/{rid2}/latency/live?since={last}").json()
+    assert all(p[0] > last for x in j3["targets"] for p in x["pts"])                         # hanya titik baru
+    # kuota sesi live
+    from app import latency as _l
+    _l.LIVE_MAX = 1
+    rid3 = main.db.ex("""INSERT INTO routers(name,host,port,username,password_enc,created_at) VALUES('R3','127.0.0.1',?,'x',?,1)""", (fr.port, main.enc("pw"))).lastrowid
+    assert c.get(f"/api/routers/{rid3}/latency/live").status_code == 429
+    _l.LIVE_MAX = 4
+    _l.LIVE_IDLE = 1; _t.sleep(2.5)                                                         # tanpa polling -> berhenti sendiri
+    assert not _l._live[rid2].alive
+    _l.LIVE_IDLE = 15
     # server mati -> 502 bukan crash
     c.put(f"/api/vpn/servers/{sid}", json={"name": "S1", "host": "127.0.0.1", "port": 1, "username": "x", "vpn_subnet": "11.11.11."})
     assert c.get(f"/api/vpn/servers/{sid}/users").status_code == 502

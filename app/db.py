@@ -27,6 +27,7 @@ DEFAULT_SETTINGS = {
     "latency_warn": 100,        # ms: di atas ini oranye
     "latency_bad": 200,         # ms: di atas ini merah
     "latency_retention_days": 7,
+    "brand_name": "Pantau Jaringan",   # nama yang tampil di sidebar/login (white-label untuk klien)
     # --- VPN ---
     "vpn_ip_start": 10,         # rentang IP statis untuk user VPN baru (oktet terakhir)
     "vpn_ip_end": 254,
@@ -95,6 +96,21 @@ CREATE TABLE IF NOT EXISTS latency(
 );
 CREATE INDEX IF NOT EXISTS ix_latency ON latency(router_id, target, ts);
 CREATE INDEX IF NOT EXISTS ix_latency_ts ON latency(ts);
+CREATE TABLE IF NOT EXISTS users(          -- akun portal klien (admin utama tetap dari .env)
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  display_name TEXT NOT NULL DEFAULT '',
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'client',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  tg_chat_ids TEXT NOT NULL DEFAULT '',
+  notify TEXT NOT NULL DEFAULT 'all',       -- all | down (hanya down/up) | off
+  last_login INTEGER,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_routers(
+  user_id INTEGER NOT NULL, router_id INTEGER NOT NULL, PRIMARY KEY(user_id, router_id)
+);
 CREATE TABLE IF NOT EXISTS vpn_servers(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,

@@ -5,6 +5,7 @@ Catatan: Mobile Legends / PUBG dipantau lewat domain situs resminya (bukan IP se
 bervariasi per region). Ganti target di Pengaturan bila Anda tahu host/IP server game yang dipakai.
 """
 import re, time, math, random, threading, logging
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from . import db, ros
 from .security import dec
@@ -158,6 +159,105 @@ def seed_demo():
     c.commit()
 
 
+# ------------------------------------------------------------------ mode LIVE (1 detik, hanya saat halaman dibuka)
+LIVE_IDLE = 15          # detik tanpa polling dari browser -> sesi berhenti sendiri
+LIVE_MAX = 4            # maksimum router yang di-live bersamaan
+_live = {}
+_live_lock = threading.Lock()
+
+
+class LiveSession:
+    """Satu koneksi API per target (paralel), ping 1x/detik, hasil disimpan di memori (tidak ke DB)."""
+
+    def __init__(self, r, targets):
+        self.r, self.targets = r, targets
+        self.buf = {n: deque(maxlen=900) for n, _ in targets}
+        self.ips = {}
+        self.err = ""
+        self.last_poll = time.time()
+        self._threads = [threading.Thread(target=self._run, args=(n, h), daemon=True, name=f"live-{r['id']}-{n}") for n, h in targets]
+        for t in self._threads:
+            t.start()
+
+    @property
+    def alive(self):
+        return any(t.is_alive() for t in self._threads)
+
+    def _idle(self):
+        return time.time() - self.last_poll > LIVE_IDLE
+
+    def _run(self, name, host):
+        r = self.r
+        demo = r["host"].startswith("demo")
+        c = None
+        try:
+            if not demo:
+                c = ros.connect(r["host"], r["port"], r["use_ssl"], r["username"], dec(r["password_enc"]), timeout=10)
+                if host == "@gateway":
+                    host = _gateway(c)
+                    if not host:
+                        self.ips[name] = ""
+                        return
+            nxt = time.time()
+            while not self._idle():
+                ts = int(time.time() * 1000)
+                try:
+                    if demo:
+                        ms, loss, ip, _ = _mock(r, name, host)
+                    else:
+                        c.deadline = time.time() + 6
+                        ms, loss, ip = _ping_once(c, host)
+                except ros.RosError as e:
+                    m = str(e)
+                    if "not enough permissions" in m.lower():
+                        self.err = "Izin user API kurang untuk ping. Jalankan di router: /user group set monitor policy=read,api,test"
+                    elif not demo:
+                        self.err = m
+                    return
+                if ip:
+                    self.ips[name] = ip
+                self.buf[name].append((ts, ms))
+                nxt += 1.0
+                time.sleep(max(0.0, min(1.0, nxt - time.time())))
+                if nxt < time.time() - 2:          # tertinggal jauh (mis. timeout) -> sinkron ulang
+                    nxt = time.time()
+        except ros.RosError as e:
+            self.err = str(e)
+        finally:
+            if c:
+                c.close()
+
+    def snapshot(self, since_ms):
+        return [{"name": n, "ip": self.ips.get(n, ""), "pts": [[t, ms] for t, ms in list(self.buf[n]) if t > since_ms]} for n, _ in self.targets]
+
+
+def _ping_once(c, host):
+    rows, _ = c.call("/ping", {"address": host, "count": "1"})
+    row = rows[-1] if rows else {}
+    ip = row.get("host", "") if IP_RE.match(row.get("host", "")) else ""
+    ms = ros.parse_ms(row.get("time")) if not row.get("status") else None
+    return ms, (0.0 if ms is not None else 100.0), ip
+
+
+def get_live(r):
+    """Ambil/buat sesi live untuk router r. Raise LiveBusy bila kuota penuh."""
+    with _live_lock:
+        for k in [k for k, v in _live.items() if not v.alive]:
+            del _live[k]
+        ss = _live.get(r["id"])
+        if ss is None:
+            if len(_live) >= LIVE_MAX:
+                raise LiveBusy(f"Maksimal {LIVE_MAX} router yang bisa di-live bersamaan. Tutup live di router lain dulu.")
+            tg = targets_for(db.get_settings())
+            ss = _live[r["id"]] = LiveSession(r, tg)
+        ss.last_poll = time.time()
+        return ss
+
+
+class LiveBusy(Exception):
+    pass
+
+
 # ------------------------------------------------------------------ scheduler
 def _safe(r):
     try:
@@ -192,7 +292,7 @@ def loop():
                 last_clean = t0
         except Exception:
             log.exception("latency loop")
-        time.sleep(max(1.0, max(20, int(s["latency_interval"])) - (time.time() - t0)))
+        time.sleep(max(1.0, max(10, int(s["latency_interval"])) - (time.time() - t0)))
 
 
 def start():

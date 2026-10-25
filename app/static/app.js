@@ -106,20 +106,23 @@ function spark(points, color) { // points [[ts,cpu,traffic]]
 }
 
 /* ---------- state & routing ---------- */
-let timer = null, refresh = null, curPage = '';
-const S = { filter: { q: '', group: '', status: 'all' }, dashRange: '6h', range: '1h', iface: {} };
+let timer = null, refresh = null, curPage = '', liveTimer = null;
+const S = { role: 'admin', filter: { q: '', group: '', status: 'all' }, dashRange: '6h', range: '1h', iface: {} };
 function setNav(p) { $$('#nav a').forEach(a => a.classList.toggle('on', a.dataset.p === p)); }
 function showLogin() { $('#app').hidden = true; $('#login').hidden = false; if (timer) clearInterval(timer); }
 async function route() {
-  if (timer) clearInterval(timer); refresh = null; destroyCharts();
+  if (timer) clearInterval(timer); if (liveTimer) { clearInterval(liveTimer); liveTimer = null; } refresh = null; destroyCharts();
   const h = location.hash.replace(/^#/, '') || '/';
   const m = h.match(/^\/router\/(\d+)/);
+  if (S.role === 'client' && !(m || ['/', '/latency', '/events', '/account'].includes(h))) { location.hash = '#/'; return; }
   try {
     if (m) { setNav('routers'); await pageDetail(+m[1]); }
     else if (h === '/routers') { setNav('routers'); await pageRouters(); }
     else if (h === '/latency') { setNav('latency'); await pageLatency(); }
     else if (h === '/vpn') { setNav('vpn'); await pageVpn(); }
     else if (h === '/events') { setNav('events'); await pageEvents(); }
+    else if (h === '/users') { setNav('users'); await pageUsers(); }
+    else if (h === '/account') { setNav('account'); await pageAccount(); }
     else if (h === '/settings') { setNav('settings'); await pageSettings(); }
     else { setNav('dash'); await pageDash(); }
   } catch (e) { if (e.message !== 'Sesi berakhir') $('#main').innerHTML = `<div class="empty">Gagal memuat: ${esc(e.message)}</div>`; return; }
@@ -142,14 +145,14 @@ function routerCard(r) {
     : st === 'down' ? `<div class="err">${esc(r.last_error || 'Tidak merespon')}</div><div class="foot"><span>${r.last_ok ? 'Terakhir online ' + ago(r.last_ok) : 'Belum pernah terhubung'}</span></div>`
       : `<div class="foot"><span>${st === 'off' ? 'Polling dimatikan' : 'Menunggu data pertama'}</span></div>`;
   const al = r.alerts.length ? `<div class="foot">${r.alerts.map(a => `<span class="chip ${a.level === 'critical' ? 'bad' : 'warn'}">${esc(a.message)}</span>`).join('')}</div>` : '';
-  return `<a class="rc ${cls}" href="#/router/${r.id}"><div class="top"><div style="min-width:0"><div class="nm">${esc(r.name)}</div><div class="ip">${esc(r.host)}${r.group_name ? ' · ' + esc(r.group_name) : ''}</div></div>${pill}</div>${body}${st === 'on' ? al : ''}</a>`;
+  return `<a class="rc ${cls}" href="#/router/${r.id}"><div class="top"><div style="min-width:0"><div class="nm">${esc(r.name)}</div><div class="ip">${[r.host, r.group_name].filter(Boolean).map(esc).join(' · ')}</div></div>${pill}</div>${body}${st === 'on' ? al : ''}</a>`;
 }
 function eventItem(e) {
   return `<li><i class="ico ${esc(e.level)}"></i><div><div class="t">${esc(e.router_name ? e.router_name + ': ' : '')}${esc(e.message)}</div><div class="m">${fmtDT(e.ts)}</div></div></li>`;
 }
 async function pageDash() {
   $('#main').innerHTML = `
-  <div class="page-head"><div><h1>Dashboard</h1><div class="sub" id="dSub"></div></div><div class="row"><a class="btn primary" href="#/routers">Tambah router</a></div></div>
+  <div class="page-head"><div><h1>Dashboard</h1><div class="sub" id="dSub"></div></div><div class="row admin-only"><a class="btn primary" href="#/routers">Tambah router</a></div></div>
   <div class="kpis" id="kpis"></div>
   <div class="split">
     <section class="panel"><header><h2>Total traffic uplink semua router</h2><div class="seg" id="dRange">${['1h', '6h', '24h', '7d'].map(r => `<button data-r="${r}" class="${S.dashRange === r ? 'on' : ''}">${r}</button>`).join('')}</div></header><div class="cwrap tall"><canvas id="fleetC"></canvas></div></section>
@@ -168,7 +171,7 @@ async function pageDash() {
       (f.status === 'all' || (f.status === 'down' && statusOf(r) === 'down') || (f.status === 'on' && statusOf(r) === 'on') || (f.status === 'alert' && r.alerts.length)));
     const rank = r => ({ down: 0, on: r.alerts.length ? 1 : 2, wait: 3, off: 4 }[statusOf(r)]);
     rs.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
-    $('#cards').innerHTML = rs.map(routerCard).join('') || '<div class="empty panel" style="grid-column:1/-1">Belum ada router yang cocok. Tambahkan lewat menu Router.</div>';
+    $('#cards').innerHTML = rs.map(routerCard).join('') || '<div class="empty panel" style="grid-column:1/-1">' + (S.role === 'client' ? 'Belum ada router yang tertaut ke akun Anda. Hubungi penyedia layanan.' : 'Belum ada router yang cocok. Tambahkan lewat menu Router.') + '</div>';
   };
   const draw = async () => {
     data = await api('/overview'); const s = data.summary;
@@ -199,12 +202,12 @@ async function pageDash() {
 /* ---------- detail router ---------- */
 const RANGES = { '1h': 3600, '3h': 10800, '6h': 21600, '24h': 86400, '7d': 604800, '30d': 2592000 };
 async function pageDetail(id) {
-  const [d0, settings] = await Promise.all([api('/routers/' + id), api('/settings')]);
+  const [d0, settings] = await Promise.all([api('/routers/' + id), api('/thresholds')]);
   $('#main').innerHTML = `<div id="dHead"></div>
   <div class="row" style="justify-content:space-between;margin-bottom:12px"><div class="seg" id="rSeg">${Object.keys(RANGES).map(r => `<button data-r="${r}" class="${S.range === r ? 'on' : ''}">${r}</button>`).join('')}</div><div class="hint" id="rHint"></div></div>
   <div class="kpis" id="dK"></div>
   <section class="panel" style="margin-bottom:12px"><header><h2>Ketersediaan</h2><div class="stat-line" id="avail"></div></header><div style="height:12px"></div><div class="strip" id="strip"></div></section>
-  <section class="panel" id="latPanel" style="margin-bottom:12px"><header><h2>Network Latency</h2><div class="row"><span class="hint" id="latHint"></span><button class="btn sm" id="latNow">Ukur sekarang</button></div></header><div id="latBody" class="lat-list"><div class="empty">Memuat…</div></div></section>
+  <section class="panel" id="latPanel" style="margin-bottom:12px"><header><h2>Network Latency</h2><div class="row"><span class="hint" id="latHint"></span><button class="btn sm admin-only" id="latLive" title="Ping tiap 1 detik selama halaman ini terbuka">● Live</button><button class="btn sm admin-only" id="latNow">Ukur sekarang</button></div></header><div id="latBody" class="lat-list"><div class="empty">Memuat…</div></div></section>
   <div id="chartGrid"></div>
   <div class="sect"><h2>Interface</h2><span class="hint">Klik bintang untuk memantau interface — alert dikirim saat link down.</span></div>
   <section class="panel"><div class="tbl-wrap"><table class="tbl" id="ifTbl"></table></div></section>
@@ -249,8 +252,8 @@ async function pageDetail(id) {
     const r = det.router, st = det.state, L = det.latest, I = det.info, on = st.online;
     const stat = !r.enabled ? '<span class="pill">Nonaktif</span>' : on ? '<span class="pill ok"><i class="dot"></i>Online</span>' : '<span class="pill bad"><i class="dot"></i>Down</span>';
     $('#dHead').innerHTML = `<div class="page-head"><div><div class="row"><a class="btn ghost sm" href="#/">← Dashboard</a></div><div class="row" style="margin-top:6px"><h1>${esc(r.name)}</h1>${stat}</div>
-      <div class="sub mono">${esc(r.host)}${r.group_name ? ' · ' + esc(r.group_name) : ''}${I.model ? ' · ' + esc(I.model) : ''}${I.version ? ' · RouterOS ' + esc(I.version) : ''}</div></div>
-      <div class="row"><button class="btn" id="pollBtn">Cek sekarang</button><button class="btn" id="diagBtn">Diagnosa</button><button class="btn" id="editBtn">Edit</button></div></div>
+      <div class="sub mono">${[r.host, r.group_name, I.model, I.version ? 'RouterOS ' + I.version : ''].filter(Boolean).map(esc).join(' · ')}</div></div>
+      <div class="row admin-only"><button class="btn" id="pollBtn">Cek sekarang</button><button class="btn" id="diagBtn">Diagnosa</button><button class="btn" id="editBtn">Edit</button></div></div>
       ${!on && st.last_poll ? `<div class="panel pad" style="border-color:var(--bad);margin-bottom:12px"><b style="color:var(--bad)">Router tidak merespon</b> — ${esc(st.last_error || '')}<div class="hint">Terakhir online ${ago(st.last_ok)} · gagal ${st.fail_count}x berturut-turut</div></div>` : ''}
       ${det.alerts.length ? `<div class="row" style="margin-bottom:12px">${det.alerts.map(a => `<span class="chip ${a.level === 'critical' ? 'bad' : 'warn'}">${esc(a.message)}</span>`).join('')}</div>` : ''}`;
     $('#pollBtn').onclick = async e => { e.target.disabled = true; try { await api(`/routers/${id}/poll`, { method: 'POST' }); await refresh(); } finally { e.target.disabled = false; } };
@@ -296,12 +299,40 @@ async function pageDetail(id) {
     drawStatic(); drawCharts(); await loadIface(); await loadLat();
   }
   async function loadLat() {
+    if (liveTimer) return;
     try {
       const j = await api(`/routers/${id}/latency?range=${S.range}`);
       $('#latHint').textContent = j.enabled ? `grafik ${S.range}` : 'dimatikan di Pengaturan';
       $('#latBody').innerHTML = (j.error ? `<div class="lat-err">${esc(j.error)}</div>` : '') + (j.targets.length ? latRows(j) : '<div class="empty">Belum ada target. Atur di Pengaturan → Network Latency.</div>');
     } catch (e) { $('#latBody').innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
   }
+  const liveBuf = {};
+  let liveSince = 0, liveBusy = false;
+  async function liveTick() {
+    if (liveBusy) return; liveBusy = true;
+    try {
+      const j = await api(`/routers/${id}/latency/live?since=${liveSince}`);
+      j.targets.forEach(t => { const b = liveBuf[t.name] = liveBuf[t.name] || { ip: '', pts: [] }; if (t.ip) b.ip = t.ip; b.pts.push(...t.pts); if (b.pts.length > 120) b.pts.splice(0, b.pts.length - 120); t.pts.forEach(p => { liveSince = Math.max(liveSince, p[0]); }); });
+      const rows = Object.keys(liveBuf).length ? j.targets.map(t => {
+        const b = liveBuf[t.name], vs = b.pts.map(p => p[1]), ok = vs.filter(v => v != null), last = vs.length ? vs[vs.length - 1] : null, rec = vs.slice(-10);
+        return { name: t.name, ip: b.ip, host: '', t: b.pts.map(p => p[0] / 1000), v: vs, fresh: vs.length > 0, ms: last, err: vs.length && last == null ? 'timeout' : '',
+          loss: rec.length ? rec.filter(v => v == null).length / rec.length * 100 : null, avg: ok.length ? ok.reduce((a, c) => a + c, 0) / ok.length : null, min: ok.length ? Math.min(...ok) : null, max: ok.length ? Math.max(...ok) : null };
+      }) : [];
+      $('#latBody').innerHTML = (j.error ? `<div class="lat-err">${esc(j.error)}</div>` : '') + (rows.length ? latRows({ targets: rows, warn: j.warn, bad: j.bad, bucket: 1 }) : '<div class="empty">Menunggu data pertama…</div>');
+    } catch (e) { $('#latBody').innerHTML = `<div class="lat-err">${esc(e.message)}</div>`; stopLive(true); }
+    finally { liveBusy = false; }
+  }
+  function startLive() {
+    liveSince = 0; Object.keys(liveBuf).forEach(k => delete liveBuf[k]);
+    $('#latLive').textContent = '■ Stop live'; $('#latLive').classList.add('primary'); $('#latHint').textContent = 'live · 1 detik · 2 menit terakhir';
+    liveTimer = setInterval(liveTick, 1000); liveTick();
+  }
+  function stopLive(keepMsg) {
+    if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+    const b = $('#latLive'); if (b) { b.textContent = '● Live'; b.classList.remove('primary'); }
+    if (!keepMsg) loadLat();
+  }
+  $('#latLive').onclick = () => liveTimer ? stopLive() : startLive();
   $('#latNow').onclick = async e => { e.target.disabled = true; try { const j = await api(`/routers/${id}/latency/probe`, { method: 'POST' }); if (!j.measured && !j.error) toast('Tidak ada target terukur'); await loadLat(); } catch (x) { toast(x.message, 'bad'); } finally { e.target.disabled = false; } };
   async function drawChartsAsync() { M = await api(`/routers/${id}/metrics?range=${S.range}`); $('#rHint').textContent = `Resolusi ${M.bucket} detik`; drawCharts(); await loadIface(true); }
   // rebind (range change)
@@ -389,7 +420,7 @@ async function pageRouters() {
 
 /* ---------- events ---------- */
 async function pageEvents() {
-  const rs = await api('/routers');
+  const rs = await api('/my/routers');
   $('#main').innerHTML = `<div class="page-head"><div><h1>Riwayat alert</h1><div class="sub">Semua kejadian: down, pulih, threshold, interface, reboot.</div></div></div>
   <div class="filters"><select id="evR"><option value="">Semua router</option>${rs.map(r => `<option value="${r.id}">${esc(r.name)}</option>`).join('')}</select>
   <select id="evL"><option value="">Semua level</option><option value="critical">Kritis</option><option value="warning">Peringatan</option><option value="ok">Pulih</option><option value="info">Info</option></select></div>
@@ -422,9 +453,10 @@ async function pageSettings() {
     ${fld('repeat_minutes', 'Ulangi alert aktif tiap (menit)', '0 = tidak diulang')}
     <div style="display:grid;gap:8px;align-content:start"><label class="chk"><input type="checkbox" name="notify_recovery" ${s.notify_recovery ? 'checked' : ''}> Kirim notifikasi saat pulih</label><label class="chk"><input type="checkbox" name="notify_reboot" ${s.notify_reboot ? 'checked' : ''}> Kirim notifikasi saat router reboot</label></div>
   </div></section></div>
+  <section class="panel"><header><h2>Portal klien</h2></header><div class="pad" style="max-width:520px"><label>Nama brand<input name="brand_name" value="${esc(s.brand_name)}" maxlength="40"><span class="hint">Tampil di sidebar, halaman login, dan judul tab — supaya portal terlihat sebagai layanan Anda. Akun klien dibuat di menu <b>Klien</b>.</span></label></div></section>
   <section class="panel"><header><h2>Network Latency</h2></header><div class="pad" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
     <div style="display:grid;gap:8px;align-content:start"><label class="chk"><input type="checkbox" name="latency_enabled" ${s.latency_enabled ? 'checked' : ''}> Aktifkan ping dari router</label><label class="chk"><input type="checkbox" name="latency_gateway" ${s.latency_gateway ? 'checked' : ''}> Ikut ping gateway router</label></div>
-    ${fld('latency_interval', 'Interval (detik)', 'Minimal 20')}${fld('latency_warn', 'Oranye di atas (ms)')}${fld('latency_bad', 'Merah di atas (ms)')}${fld('latency_retention_days', 'Simpan riwayat (hari)')}
+    ${fld('latency_interval', 'Interval (detik)', 'Minimal 10')}${fld('latency_warn', 'Oranye di atas (ms)')}${fld('latency_bad', 'Merah di atas (ms)')}${fld('latency_retention_days', 'Simpan riwayat (hari)')}
     <label style="grid-column:1/-1">Target ping<input name="latency_targets" value="${esc(s.latency_targets)}" class="mono"><span class="hint">Format <span class="mono">Nama:host</span>, pisahkan koma. Mobile Legends &amp; PUBG memakai domain situs resminya; ganti dengan IP/host server game yang Anda pakai bila perlu.</span></label></div></section>
   <section class="panel"><header><h2>VPN (user baru &amp; port-forward)</h2></header><div class="pad" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
     ${fld('vpn_ip_start', 'IP statis mulai (oktet terakhir)')}${fld('vpn_ip_end', 'IP statis sampai')}${fld('vpn_nat_port_min', 'Port publik minimum')}${fld('vpn_nat_port_max', 'Port publik maksimum')}
@@ -637,6 +669,82 @@ function openDiag(base, title) {
   view();
 }
 
+/* ---------- akun klien (admin) ---------- */
+function credText(u, p) { return `Portal monitoring: ${location.origin}\nUsername: ${u}\nPassword: ${p}`; }
+function showCreds(u, p, title) {
+  const t = credText(u, p);
+  openModal(`<div class="sheet"><header><h2>${esc(title)}</h2><button class="btn ghost sm" onclick="closeModal()">✕</button></header><div class="pad">
+    <p class="muted" style="margin-top:0">Kirim ke klien sekarang. Password tidak bisa dilihat lagi nanti (hanya bisa direset).</p>
+    <pre class="code">${esc(t)}</pre><button class="btn primary" id="ccp">Salin</button></div></div>`);
+  copyBtn('#ccp', t);
+}
+const NOTIFY_LABEL = { all: 'Semua kejadian', down: 'Hanya router mati/hidup', off: 'Mati' };
+function openUserForm(u, routers, done) {
+  const e = !!u; u = u || { enabled: true, notify: 'all', router_ids: [], tg_chat_ids: '' };
+  const groups = {}; routers.forEach(r => (groups[r.group_name || 'Tanpa grup'] = groups[r.group_name || 'Tanpa grup'] || []).push(r));
+  openModal(`<form class="sheet" id="uf2"><header><h2>${e ? 'Edit klien' : 'Tambah klien'}</h2><button type="button" class="btn ghost sm" id="uX">✕</button></header><div class="body">
+    <label>Username<input name="username" value="${esc(u.username || '')}" required pattern="[A-Za-z0-9_.@\\-]{3,40}" autocomplete="off" placeholder="toko_maju"></label>
+    <label>Nama tampilan<input name="display_name" value="${esc(u.display_name || '')}" placeholder="Toko Maju"></label>
+    <label>${e ? 'Reset password' : 'Password'}<input name="password" class="mono" autocomplete="new-password" placeholder="${e ? 'kosongkan bila tidak diubah' : 'kosong = dibuat acak'}"></label>
+    <label>Chat ID Telegram<input name="tg_chat_ids" class="mono" value="${esc(u.tg_chat_ids || '')}" placeholder="boleh lebih dari satu, pisahkan koma"><span class="hint">Klien kirim <span class="mono">/id</span> ke bot untuk mengetahuinya. Klien juga bisa mengisi sendiri di menu Akun saya.</span></label>
+    <label>Notifikasi<select name="notify">${Object.entries(NOTIFY_LABEL).map(([k, v]) => `<option value="${k}" ${u.notify === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+    <label class="chk"><input type="checkbox" name="enabled" ${u.enabled ? 'checked' : ''}> Akun aktif</label>
+    <div class="full"><div style="font-weight:600;margin-bottom:6px">Router yang boleh dilihat <span class="hint" id="ucnt"></span></div>
+      <div style="max-height:240px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:6px 10px">${Object.entries(groups).map(([g, rs]) => `<div class="hint" style="margin:8px 0 2px">${esc(g)}</div>${rs.map(r => `<label class="chk" style="padding:3px 0"><input type="checkbox" name="rt" value="${r.id}" ${u.router_ids.includes(r.id) ? 'checked' : ''}> ${esc(r.name)}</label>`).join('')}`).join('') || '<div class="empty">Belum ada router.</div>'}</div></div>
+  </div><footer>${e ? '<button type="button" class="btn danger" id="uDel" style="margin-right:auto">Hapus</button>' : ''}<button type="button" class="btn" id="uC">Batal</button><button class="btn primary" type="submit">Simpan</button></footer></form>`);
+  const f = $('#uf2'), cnt = () => { $('#ucnt').textContent = `· ${$$('[name=rt]:checked', f).length} dipilih`; };
+  $('#uX').onclick = $('#uC').onclick = closeModal; f.addEventListener('change', cnt); cnt();
+  if (e) $('#uDel').onclick = async () => { if (!confirm(`Hapus akun klien "${u.username}"?`)) return; await api('/users/' + u.id, { method: 'DELETE' }); closeModal(); toast('Akun dihapus', 'ok'); done(); };
+  f.onsubmit = async ev => {
+    ev.preventDefault();
+    const body = { username: f.username.value.trim(), display_name: f.display_name.value, password: f.password.value || null, tg_chat_ids: f.tg_chat_ids.value,
+      notify: f.notify.value, enabled: f.enabled.checked, router_ids: $$('[name=rt]:checked', f).map(x => +x.value) };
+    try {
+      const j = await api(e ? '/users/' + u.id : '/users', { method: e ? 'PUT' : 'POST', body });
+      closeModal(); done();
+      if (!e) showCreds(j.username, j.password, 'Akun klien dibuat');
+      else if (body.password) showCreds(body.username, body.password, 'Password direset'); else toast('Tersimpan', 'ok');
+    } catch (x) { toast(x.message, 'bad'); }
+  };
+}
+async function pageUsers() {
+  $('#main').innerHTML = `<div class="page-head"><div><h1>Klien</h1><div class="sub">Akun portal untuk pelanggan: mereka hanya melihat router miliknya (baca-saja) dan menerima notifikasi Telegram.</div></div><div class="row"><button class="btn primary" id="uAdd">Tambah klien</button></div></div>
+  <section class="panel"><div class="tbl-wrap"><table class="tbl" id="uT"></table></div></section>`;
+  const load = async () => {
+    const [us, rs] = await Promise.all([api('/users'), api('/routers')]);
+    const rn = Object.fromEntries(rs.map(r => [r.id, r.name]));
+    $('#uAdd').onclick = () => openUserForm(null, rs, load);
+    $('#uT').innerHTML = `<thead><tr><th>Klien</th><th>Router</th><th>Telegram</th><th>Terakhir masuk</th><th>Status</th><th></th></tr></thead><tbody>${us.map(u => `<tr>
+      <td><b>${esc(u.display_name || u.username)}</b><div class="dim mono" style="font-size:12px">${esc(u.username)}</div></td>
+      <td style="max-width:260px">${u.router_ids.map(i => `<span class="chip">${esc(rn[i] || '#' + i)}</span>`).join('') || '<span class="dim">–</span>'}</td>
+      <td>${u.tg_chat_ids ? `<span class="pill ok">Chat ID terisi</span><div class="dim" style="font-size:12px">${esc(NOTIFY_LABEL[u.notify])}</div>` : '<span class="pill">Belum diisi</span>'}</td>
+      <td class="dim">${u.last_login ? ago(u.last_login) : 'belum pernah'}</td>
+      <td>${u.enabled ? '<span class="pill ok">Aktif</span>' : '<span class="pill warn">Nonaktif</span>'}</td>
+      <td class="r" style="white-space:nowrap">${u.tg_chat_ids ? `<button class="btn sm" data-t="${u.id}">Tes notifikasi</button> ` : ''}<button class="btn sm" data-e="${u.id}">Edit</button></td></tr>`).join('') || '<tr><td colspan="6" class="empty">Belum ada akun klien.</td></tr>'}</tbody>`;
+    $$('[data-e]').forEach(b => b.onclick = () => openUserForm(us.find(x => x.id === +b.dataset.e), rs, load));
+    $$('[data-t]').forEach(b => b.onclick = async () => { b.disabled = true; try { const j = await api(`/users/${b.dataset.t}/test-notify`, { method: 'POST' }); toast(j.ok ? 'Terkirim ke Telegram klien' : 'Gagal: ' + (j.error || ''), j.ok ? 'ok' : 'bad'); } catch (x) { toast(x.message, 'bad'); } finally { b.disabled = false; } });
+  };
+  await load();
+}
+
+/* ---------- akun saya (klien) ---------- */
+async function pageAccount() {
+  const p = await api('/me/profile');
+  $('#main').innerHTML = `<div class="page-head"><div><h1>Akun saya</h1><div class="sub">${esc(p.display_name || p.username)} · ${esc(p.username)}</div></div></div>
+  <section class="panel" style="margin-bottom:12px"><header><h2>Notifikasi Telegram</h2></header><form id="pf" class="pad" style="display:grid;gap:12px;max-width:520px">
+    ${p.telegram_ready ? '' : '<div class="lat-err">Notifikasi Telegram belum diaktifkan oleh penyedia layanan.</div>'}
+    <label>Chat ID Telegram<input name="tg" class="mono" value="${esc(p.tg_chat_ids)}" placeholder="contoh 123456789"><span class="hint">Cara mendapatkan: buka bot Telegram dari penyedia layanan, tekan Start, lalu kirim <span class="mono">/id</span>. Salin angkanya ke sini. Bisa lebih dari satu (pisahkan koma), mis. untuk grup.</span></label>
+    <label>Jenis notifikasi<select name="notify">${Object.entries(NOTIFY_LABEL).map(([k, v]) => `<option value="${k}" ${p.notify === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+    <div class="row"><button class="btn primary" type="submit">Simpan</button><button class="btn" type="button" id="pTest">Kirim tes</button></div></form></section>
+  <section class="panel"><header><h2>Ganti password</h2></header><form id="pw" class="pad" style="display:grid;gap:12px;max-width:520px">
+    <label>Password saat ini<input name="cur" type="password" autocomplete="current-password" required></label>
+    <label>Password baru<input name="nw" type="password" autocomplete="new-password" minlength="8" required><span class="hint">Minimal 8 karakter.</span></label>
+    <div><button class="btn primary" type="submit">Ganti password</button></div></form></section>`;
+  $('#pf').onsubmit = async ev => { ev.preventDefault(); const f = ev.target; try { await api('/me/profile', { method: 'PUT', body: { tg_chat_ids: f.tg.value, notify: f.notify.value } }); toast('Tersimpan', 'ok'); } catch (x) { toast(x.message, 'bad'); } };
+  $('#pTest').onclick = async () => { try { const j = await api('/me/test-notify', { method: 'POST' }); toast(j.ok ? 'Tes terkirim, cek Telegram Anda' : 'Gagal: ' + (j.error || ''), j.ok ? 'ok' : 'bad'); } catch (x) { toast(x.message, 'bad'); } };
+  $('#pw').onsubmit = async ev => { ev.preventDefault(); const f = ev.target; try { await api('/me/password', { method: 'PUT', body: { current: f.cur.value, new: f.nw.value } }); f.reset(); toast('Password diganti', 'ok'); } catch (x) { toast(x.message, 'bad'); } };
+}
+
 /* ---------- boot ---------- */
 $('#loginForm').onsubmit = async e => {
   e.preventDefault(); const f = e.target; $('#loginErr').textContent = '';
@@ -648,8 +756,14 @@ $('#themeBtn').onclick = () => {
   const cur = document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'), nx = cur === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = nx; try { localStorage.setItem('theme', nx); } catch (e) { } route();
 };
+function applyBrand(me) {
+  const b = (me && me.brand) || 'Pantau Jaringan';
+  $$('.brand-name').forEach(e => { e.textContent = b; }); document.title = b;
+}
 async function start() {
-  try { const me = await api('/me'); if (!me.user) return showLogin(); } catch (e) { return showLogin(); }
+  let me;
+  try { me = await api('/me'); applyBrand(me); if (!me.user) return showLogin(); } catch (e) { return showLogin(); }
+  S.role = me.role || 'admin'; document.body.classList.toggle('role-client', S.role === 'client');
   $('#login').hidden = true; $('#app').hidden = false; route();
 }
 start();

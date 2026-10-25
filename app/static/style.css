@@ -212,3 +212,8 @@ details summary{cursor:pointer;color:var(--tx2)}
 .lat-err{margin:8px 0;padding:8px 12px;border-radius:8px;border:1px solid var(--warn);color:var(--warn);font-size:13px}
 .lat-tbl td,.lat-tbl th{white-space:nowrap}
 @media(max-width:560px){.lat-row{grid-template-columns:38px 1fr 76px;}.lat-sp{display:none}}
+
+/* portal klien */
+body.role-client .admin-only{display:none!important}
+body:not(.role-client) .client-only{display:none!important}
+body.role-client .star{pointer-events:none}

@@ -8,6 +8,7 @@ ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
 TZ_NAME = os.environ.get("TZ", "Asia/Jakarta")
 DEMO = os.environ.get("DEMO", "0") == "1"
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0") == "1"   # 1 bila diakses lewat HTTPS (reverse proxy)
 
 
 def _secret():
