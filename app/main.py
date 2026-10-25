@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import db, poller, ros, telegram as tg, demo, vpn, diag, latency
-from .config import ADMIN_USER, ADMIN_PASSWORD, SECRET_KEY, DEMO, COOKIE_SECURE
+from .config import ADMIN_USER, ADMIN_PASSWORD, SECRET_KEY, DEMO, COOKIE_SECURE, APP_VERSION
 from .security import enc, dec, hash_password, verify_password, _DUMMY
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -31,7 +31,16 @@ async def lifespan(app):
 
 app = FastAPI(title="MikroTik Monitor", lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=14 * 86400, same_site="lax", https_only=COOKIE_SECURE)
-app.mount("/static", StaticFiles(directory=STATIC), name="static")
+class NoCacheStatic(StaticFiles):
+    """File statis selalu divalidasi ulang (ETag) agar update app.js/style.css langsung terpakai, tanpa Ctrl+Shift+R."""
+
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
+app.mount("/static", NoCacheStatic(directory=STATIC), name="static")
 
 
 def _ctx(request: Request):
@@ -138,8 +147,8 @@ def me(request: Request):
     try:
         c = _ctx(request)
     except HTTPException:
-        return {"user": None, "demo": DEMO, "brand": brand}
-    return {"user": c["username"], "name": c["name"], "role": c["role"], "demo": DEMO, "brand": brand}
+        return {"user": None, "demo": DEMO, "brand": brand, "version": APP_VERSION}
+    return {"user": c["username"], "name": c["name"], "role": c["role"], "demo": DEMO, "brand": brand, "version": APP_VERSION}
 
 
 @app.get("/")
@@ -149,7 +158,7 @@ def index():
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True}
+    return {"ok": True, "version": APP_VERSION}
 
 
 # ------------------------------------------------------------------ helpers

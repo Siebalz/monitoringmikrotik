@@ -729,6 +729,7 @@ async function pageUsers() {
 
 /* ---------- akun saya (klien) ---------- */
 async function pageAccount() {
+  if (S.role !== 'client') { $('#main').innerHTML = '<div class="empty panel">Halaman ini untuk akun klien. Akun admin diatur lewat file .env, dan akun klien dikelola di menu <a href="#/users">Klien</a>.</div>'; return; }
   const p = await api('/me/profile');
   $('#main').innerHTML = `<div class="page-head"><div><h1>Akun saya</h1><div class="sub">${esc(p.display_name || p.username)} · ${esc(p.username)}</div></div></div>
   <section class="panel" style="margin-bottom:12px"><header><h2>Notifikasi Telegram</h2></header><form id="pf" class="pad" style="display:grid;gap:12px;max-width:520px">
@@ -759,6 +760,7 @@ $('#themeBtn').onclick = () => {
 function applyBrand(me) {
   const b = (me && me.brand) || 'Pantau Jaringan';
   $$('.brand-name').forEach(e => { e.textContent = b; }); document.title = b;
+  const v = $('#ver'); if (v && me && me.version) v.textContent = 'v' + me.version;
 }
 async function start() {
   let me;
