@@ -2,7 +2,7 @@ import json, time, threading, logging, hmac, os, re
 from contextlib import asynccontextmanager
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
@@ -153,7 +153,16 @@ def me(request: Request):
 
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(STATIC, "index.html"), headers={"Cache-Control": "no-cache"})
+    """Halaman utama. URL app.js/style.css diberi ?v=<versi+waktu-ubah> sehingga browser PASTI mengambil file terbaru setelah update."""
+    with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    for name in ("app.js", "style.css"):
+        try:
+            v = f"{APP_VERSION}-{int(os.path.getmtime(os.path.join(STATIC, name)))}"
+        except OSError:
+            continue
+        html = html.replace(f'/static/{name}"', f'/static/{name}?v={v}"')
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/healthz")
@@ -374,7 +383,7 @@ def update_router(rid: int, b: RouterIn):
 @app.delete("/api/routers/{rid}", dependencies=[Depends(auth)])
 def delete_router(rid: int):
     _load(rid)
-    for t in ("routers", "router_state", "metrics", "iface_metrics", "alert_state", "watched_ifaces"):
+    for t in ("routers", "router_state", "metrics", "iface_metrics", "alert_state", "watched_ifaces", "sessions", "sess_seed"):
         db.ex(f"DELETE FROM {t} WHERE {'id' if t == 'routers' else 'router_id'}=?", (rid,))
     db.ex("DELETE FROM user_routers WHERE router_id=?", (rid,))
     return {"ok": True}
@@ -610,7 +619,7 @@ def vpn_user_delete(sid: int, secret_id: str, request: Request, remove_monitor: 
     if lk:
         db.ex("DELETE FROM vpn_links WHERE server_id=? AND username=?", (sid, res["username"]))
         if remove_monitor:
-            for t in ("routers", "router_state", "metrics", "iface_metrics", "alert_state", "watched_ifaces"):
+            for t in ("routers", "router_state", "metrics", "iface_metrics", "alert_state", "watched_ifaces", "sessions", "sess_seed"):
                 db.ex(f"DELETE FROM {t} WHERE {'id' if t == 'routers' else 'router_id'}=?", (lk["router_id"],))
     _audit(request, f"User VPN dihapus: {res['username']} dari {srv['name']} ({res['removed_nat']} NAT rule dibersihkan)")
     return res
@@ -970,3 +979,18 @@ def my_routers(request: Request):
     sc = scope(request)
     rows = db.q("SELECT id, name, group_name FROM routers ORDER BY name")
     return rows if sc is None else [r for r in rows if r["id"] in sc]
+
+
+# ------------------------------------------------------------------ sesi aktif (PPPoE / hotspot / VPN)
+@app.get("/api/routers/{rid}/sessions", dependencies=[Depends(auth_any)])
+def router_sessions(rid: int, request: Request):
+    _check(request, rid)
+    _load(rid)
+    st = db.get_settings()
+    rows = db.q("""SELECT kind, name, address, caller, uptime, first_seen, last_seen FROM sessions
+                   WHERE router_id=? ORDER BY kind, name COLLATE NOCASE""", (rid,))
+    counts = {}
+    for r in rows:
+        counts[r["kind"]] = counts.get(r["kind"], 0) + 1
+    return {"rows": rows[:1500], "counts": counts, "total": len(rows), "now": int(time.time()),
+            "enabled": [k for k in ("pppoe", "hotspot", "vpn") if st[f"sess_{k}"] != "off"]}

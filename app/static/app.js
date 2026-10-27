@@ -208,6 +208,7 @@ async function pageDetail(id) {
   <div class="kpis" id="dK"></div>
   <section class="panel" style="margin-bottom:12px"><header><h2>Ketersediaan</h2><div class="stat-line" id="avail"></div></header><div style="height:12px"></div><div class="strip" id="strip"></div></section>
   <section class="panel" id="latPanel" style="margin-bottom:12px"><header><h2>Network Latency</h2><div class="row"><span class="hint" id="latHint"></span><button class="btn sm admin-only" id="latLive" title="Ping tiap 1 detik selama halaman ini terbuka">● Live</button><button class="btn sm admin-only" id="latNow">Ukur sekarang</button></div></header><div id="latBody" class="lat-list"><div class="empty">Memuat…</div></div></section>
+  <section class="panel" id="sessPanel" style="margin-bottom:12px" hidden><header><h2>Sesi aktif</h2><div class="row"><div class="seg" id="sessTabs"></div><input id="sessQ" type="search" placeholder="Cari user / IP / MAC" style="width:190px"></div></header><div id="sessBody"></div></section>
   <div id="chartGrid"></div>
   <div class="sect"><h2>Interface</h2><span class="hint">Klik bintang untuk memantau interface — alert dikirim saat link down.</span></div>
   <section class="panel"><div class="tbl-wrap"><table class="tbl" id="ifTbl"></table></div></section>
@@ -296,7 +297,7 @@ async function pageDetail(id) {
     [det, M] = await Promise.all([api('/routers/' + id), api(`/routers/${id}/metrics?range=${S.range}`)]);
     wanted = new Set(det.watched);
     $('#rHint').textContent = `Resolusi ${M.bucket} detik`;
-    drawStatic(); drawCharts(); await loadIface(); await loadLat();
+    drawStatic(); drawCharts(); await loadIface(); await loadLat(); await loadSess();
   }
   async function loadLat() {
     if (liveTimer) return;
@@ -306,6 +307,25 @@ async function pageDetail(id) {
       $('#latBody').innerHTML = (j.error ? `<div class="lat-err">${esc(j.error)}</div>` : '') + (j.targets.length ? latRows(j) : '<div class="empty">Belum ada target. Atur di Pengaturan → Network Latency.</div>');
     } catch (e) { $('#latBody').innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
   }
+  let sessData = null, sessKind = 'all';
+  const SK = { pppoe: 'PPPoE', hotspot: 'Hotspot', vpn: 'VPN' };
+  function drawSess() {
+    const j = sessData, q = $('#sessQ').value.toLowerCase();
+    const kinds = Object.keys(j.counts);
+    $('#sessTabs').innerHTML = `<button data-k="all" class="${sessKind === 'all' ? 'on' : ''}">Semua ${j.total}</button>` + kinds.map(k => `<button data-k="${k}" class="${sessKind === k ? 'on' : ''}">${SK[k]} ${j.counts[k]}</button>`).join('');
+    $$('#sessTabs button').forEach(b => b.onclick = () => { sessKind = b.dataset.k; drawSess(); });
+    const rows = j.rows.filter(r => (sessKind === 'all' || r.kind === sessKind) && (!q || (r.name + r.address + r.caller).toLowerCase().includes(q)));
+    $('#sessBody').innerHTML = `<div class="tbl-wrap" style="max-height:360px;overflow:auto"><table class="tbl"><thead><tr><th>Jenis</th><th>User</th><th>IP</th><th>MAC / asal</th><th class="r">Online</th></tr></thead><tbody>${rows.slice(0, 300).map(r => `<tr><td><span class="pill">${SK[r.kind] || r.kind}</span></td><td><b>${esc(r.name)}</b></td><td class="mono">${esc(r.address) || '–'}</td><td class="mono dim" style="font-size:12px">${esc(r.caller) || '–'}</td><td class="r dim">${dur(j.now - r.first_seen)}</td></tr>`).join('') || `<tr><td colspan="5" class="empty">${j.total ? 'Tidak ada yang cocok.' : 'Belum ada sesi aktif.'}</td></tr>`}</tbody></table></div>${rows.length > 300 ? `<div class="hint" style="padding:6px 16px">Menampilkan 300 dari ${rows.length}. Gunakan pencarian.</div>` : ''}`;
+  }
+  async function loadSess() {
+    try {
+      sessData = await api(`/routers/${id}/sessions`);
+      const on = sessData.enabled.length > 0 || sessData.total > 0;
+      $('#sessPanel').hidden = !on;
+      if (on) drawSess();
+    } catch (e) { $('#sessPanel').hidden = true; }
+  }
+  $('#sessQ').oninput = () => sessData && drawSess();
   const liveBuf = {};
   let liveSince = 0, liveBusy = false;
   async function liveTick() {
@@ -453,6 +473,11 @@ async function pageSettings() {
     ${fld('repeat_minutes', 'Ulangi alert aktif tiap (menit)', '0 = tidak diulang')}
     <div style="display:grid;gap:8px;align-content:start"><label class="chk"><input type="checkbox" name="notify_recovery" ${s.notify_recovery ? 'checked' : ''}> Kirim notifikasi saat pulih</label><label class="chk"><input type="checkbox" name="notify_reboot" ${s.notify_reboot ? 'checked' : ''}> Kirim notifikasi saat router reboot</label></div>
   </div></section></div>
+  <section class="panel"><header><h2>Notifikasi sesi (PPPoE / Hotspot / VPN)</h2></header><div class="pad" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px">
+    ${[['sess_pppoe', 'Sesi PPPoE'], ['sess_hotspot', 'Sesi Hotspot'], ['sess_vpn', 'Sesi VPN (L2TP/SSTP/OVPN)']].map(([k, l]) => `<label>${l}<select name="${k}"><option value="off" ${s[k] === 'off' ? 'selected' : ''}>Mati</option><option value="watch" ${s[k] === 'watch' ? 'selected' : ''}>Hanya user di daftar</option><option value="all" ${s[k] === 'all' ? 'selected' : ''}>Semua user</option></select></label>`).join('')}
+    ${fld('sess_grace_polls', 'Putus setelah hilang (poll)', '2 poll ≈ 1 menit; mencegah notifikasi bolak-balik pada koneksi tidak stabil')}${fld('sess_mass_drop', 'Ringkas bila ≥ N sesi', 'Banyak sesi putus/tersambung sekaligus dikirim sebagai 1 pesan')}
+    <label class="chk" style="align-self:end"><input type="checkbox" name="sess_notify_login" ${s.sess_notify_login ? 'checked' : ''}> Beri tahu juga saat user tersambung</label>
+    <label style="grid-column:1/-1">Daftar user yang dipantau (mode "Hanya user di daftar")<textarea name="sess_watch" rows="3" class="mono" placeholder="satu per baris atau pisahkan koma; boleh wildcard, mis. vip-*">${esc(s.sess_watch)}</textarea><span class="hint">Tidak peka huruf besar/kecil. Jenis yang diatur "Mati" tidak diambil dari router sama sekali, jadi tidak menambah beban.</span></label></div></section>
   <section class="panel"><header><h2>Portal klien</h2></header><div class="pad" style="max-width:520px"><label>Nama brand<input name="brand_name" value="${esc(s.brand_name)}" maxlength="40"><span class="hint">Tampil di sidebar, halaman login, dan judul tab — supaya portal terlihat sebagai layanan Anda. Akun klien dibuat di menu <b>Klien</b>.</span></label></div></section>
   <section class="panel"><header><h2>Network Latency</h2></header><div class="pad" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
     <div style="display:grid;gap:8px;align-content:start"><label class="chk"><input type="checkbox" name="latency_enabled" ${s.latency_enabled ? 'checked' : ''}> Aktifkan ping dari router</label><label class="chk"><input type="checkbox" name="latency_gateway" ${s.latency_gateway ? 'checked' : ''}> Ikut ping gateway router</label></div>
@@ -464,7 +489,7 @@ async function pageSettings() {
     <label>Sumber akses API monitoring<input name="vpn_monitor_address" value="${esc(s.vpn_monitor_address)}" class="mono" placeholder="kosong = subnet VPN /24"><span class="hint">Dipakai di script client (<span class="mono">address=</span>)</span></label></div></section>
   <section class="panel"><header><h2>Polling & penyimpanan</h2></header><div class="pad" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
     ${fld('poll_interval', 'Interval polling (detik)', 'Minimal 10')}${fld('metrics_retention_days', 'Simpan metrik (hari)')}${fld('iface_retention_days', 'Simpan traffic interface (hari)')}</div></section></form>`;
-  const collect = () => { const o = {}; $$('#sf input').forEach(i => { o[i.name] = i.type === 'checkbox' ? i.checked : i.value; }); return o; };
+  const collect = () => { const o = {}; $$('#sf input, #sf select, #sf textarea').forEach(i => { if (i.name) o[i.name] = i.type === 'checkbox' ? i.checked : i.value; }); return o; };
   $('#save').onclick = async () => { try { await api('/settings', { method: 'PUT', body: collect() }); toast('Pengaturan disimpan', 'ok'); route(); } catch (e) { toast(e.message, 'bad'); } };
   $('#tgTest').onclick = async () => { try { await api('/settings', { method: 'PUT', body: collect() }); const j = await api('/telegram/test', { method: 'POST' }); toast(j.ok ? 'Pesan tes terkirim ke Telegram' : 'Gagal: ' + j.error, j.ok ? 'ok' : 'bad'); } catch (e) { toast(e.message, 'bad'); } };
   const c = $('#tgClear'); if (c) c.onclick = async () => { if (confirm('Hapus token bot?')) { await api('/settings', { method: 'PUT', body: { tg_token_clear: true } }); route(); } };

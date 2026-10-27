@@ -11,6 +11,21 @@ Server ini menarik data lewat **RouterOS API** ke IP VPN tiap router (tanpa agen
 - Bot Telegram interaktif: `/status`, `/routers`, `/router <nama>`, `/alerts`, `/id`
 - Password router disimpan terenkripsi (Fernet); login admin; semua data di SQLite (`data/monitor.db`)
 
+## Notifikasi sesi PPPoE / Hotspot / VPN
+
+Beri tahu saat user **tersambung** atau **putus** di router yang dipantau. Aktifkan di **Pengaturan → Notifikasi sesi** (bawaan: mati, sehingga router tidak terbebani):
+
+- Tiap jenis (PPPoE, Hotspot, VPN L2TP/SSTP/OVPN) punya mode: **Mati**, **Hanya user di daftar** (nama persis atau wildcard, mis. `vip-*`), atau **Semua user**
+- **Anti-flapping:** putus baru diumumkan setelah sesi hilang N poll berturut-turut (bawaan 2 ≈ 1 menit). Koneksi yang cuma berkedip tidak membuat pesan bolak-balik
+- **Ringkasan massal:** bila ≥ N sesi putus/tersambung sekaligus (bawaan 5), dikirim 1 pesan berisi daftar nama, misalnya *"12 sesi PPPoE putus bersamaan — kemungkinan gangguan uplink"*, bukan 12 pesan
+- Poll pertama setelah fitur dinyalakan hanya mencatat kondisi awal, jadi tidak ada banjir notifikasi
+- Pesan putus menyebut lama online dan IP terakhir. Semua kejadian juga masuk **Riwayat alert** (jenis `session`)
+- Panel **Sesi aktif** di detail router menampilkan daftar user online (jenis, IP, MAC, lama online) dengan pencarian
+- Klien portal dengan notifikasi "Semua kejadian" menerima ini untuk router miliknya saja; mode "Hanya router mati/hidup" tidak menerimanya
+
+Sumber data: `/ppp/active` dan `/ip/hotspot/active` (cukup policy `read`). Router tanpa paket hotspot dilewati tanpa error.
+> Tes: `python tests/test_sessions.py`
+
 ## Portal klien (untuk jasa NOC / setting)
 
 Buat akun untuk pelanggan di menu **Klien**. Tiap klien login ke alamat web yang sama, tetapi:

@@ -27,6 +27,14 @@ DEFAULT_SETTINGS = {
     "latency_warn": 100,        # ms: di atas ini oranye
     "latency_bad": 200,         # ms: di atas ini merah
     "latency_retention_days": 7,
+    # --- notifikasi sesi PPPoE / Hotspot / VPN (login & putus) ---
+    "sess_pppoe": "off",        # off | watch (hanya user di daftar) | all
+    "sess_hotspot": "off",
+    "sess_vpn": "off",          # sesi PPP non-PPPoE: L2TP, SSTP, OVPN, PPTP
+    "sess_watch": "",           # daftar user yang dipantau (mode watch): satu per baris/koma, boleh wildcard *
+    "sess_grace_polls": 2,      # sesi dianggap putus bila hilang N poll berturut-turut (anti-flapping)
+    "sess_notify_login": True,  # kirim juga notifikasi saat user tersambung
+    "sess_mass_drop": 5,        # >= N sesi berubah dalam 1 poll -> satu ringkasan, bukan pesan satu-satu
     "brand_name": "Pantau Jaringan",   # nama yang tampil di sidebar/login (white-label untuk klien)
     # --- VPN ---
     "vpn_ip_start": 10,         # rentang IP statis untuk user VPN baru (oktet terakhir)
@@ -111,6 +119,13 @@ CREATE TABLE IF NOT EXISTS users(          -- akun portal klien (admin utama tet
 CREATE TABLE IF NOT EXISTS user_routers(
   user_id INTEGER NOT NULL, router_id INTEGER NOT NULL, PRIMARY KEY(user_id, router_id)
 );
+CREATE TABLE IF NOT EXISTS sessions(       -- sesi aktif terakhir yang terlihat (PPPoE / hotspot / VPN)
+  router_id INTEGER NOT NULL, kind TEXT NOT NULL, skey TEXT NOT NULL,
+  name TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', caller TEXT NOT NULL DEFAULT '', uptime TEXT NOT NULL DEFAULT '',
+  first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, miss INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(router_id, kind, skey)
+);
+CREATE TABLE IF NOT EXISTS sess_seed(router_id INTEGER NOT NULL, kind TEXT NOT NULL, PRIMARY KEY(router_id, kind));
 CREATE TABLE IF NOT EXISTS vpn_servers(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,

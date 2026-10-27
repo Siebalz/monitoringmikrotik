@@ -211,7 +211,37 @@ def _try(c, host, key, fn):
         return None
 
 
-def fetch(router, password):
+_DUR = re.compile(r"(\d+)([wdhms])")
+
+
+def parse_dur(v):
+    """'1w2d3h4m5s' / '3h20m' / '45s' -> detik (0 bila tak terbaca)."""
+    return sum(int(n) * {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1}[u] for n, u in _DUR.findall(str(v or "")))
+
+
+def fetch_sessions(c, host, kinds):
+    """Sesi aktif per jenis. Nilai None = gagal diambil (JANGAN dianggap semua user putus)."""
+    out = {k: None for k in kinds}
+    if "pppoe" in kinds or "vpn" in kinds:
+        rows = _try(c, host, "pppact", lambda: c.call("/ppp/active/print", proplist=["name", "service", "address", "caller-id", "uptime"])[0])
+        if rows is not None:
+            for k in ("pppoe", "vpn"):
+                if k in kinds:
+                    out[k] = []
+            for r in rows:
+                k = "pppoe" if r.get("service") == "pppoe" else "vpn"
+                if k in kinds and r.get("name"):
+                    out[k].append({"name": r["name"], "address": r.get("address", ""), "caller": r.get("caller-id", ""),
+                                   "uptime": r.get("uptime", ""), "service": r.get("service", "")})
+    if "hotspot" in kinds:
+        rows = _try(c, host, "hsact", lambda: c.call("/ip/hotspot/active/print", proplist=["user", "address", "mac-address", "uptime"])[0])
+        if rows is not None:
+            out["hotspot"] = [{"name": r["user"], "address": r.get("address", ""), "caller": r.get("mac-address", ""),
+                               "uptime": r.get("uptime", ""), "service": "hotspot"} for r in rows if r.get("user")]
+    return out
+
+
+def fetch(router, password, sess_kinds=()):
     """Ambil semua metrik dari 1 router. Raise RosError bila gagal."""
     c = RosClient(router["host"], router["port"], bool(router["use_ssl"]))
     try:
@@ -247,6 +277,7 @@ def fetch(router, password):
         } for i in ifs]
         ppp = _try(c, host, "ppp", lambda: c.count("/ppp/active/print"))
         dhcp = _try(c, host, "dhcp", lambda: c.count("/ip/dhcp-server/lease/print", ["?status=bound"]))
+        sessions = fetch_sessions(c, host, sess_kinds) if sess_kinds else {}
         wifi = None
         for key, path in (("wifi7", "/interface/wifi/registration-table/print"),
                           ("wifi2", "/interface/wifiwave2/registration-table/print"),
@@ -267,7 +298,7 @@ def fetch(router, password):
             "hdd_pct": ((ht - hf) / ht * 100) if ht else None,
             "temp": temp, "volt": volt,
             "uptime": parse_uptime(res.get("uptime", "")),
-            "ifaces": ifaces, "ppp": ppp, "dhcp": dhcp, "wifi": wifi, "conn": conn_n,
+            "ifaces": ifaces, "ppp": ppp, "dhcp": dhcp, "wifi": wifi, "conn": conn_n, "sessions": sessions,
             "info": {
                 "identity": ident,
                 "version": res.get("version", ""),
@@ -291,7 +322,23 @@ _mock_lock = threading.Lock()
 _BOOT = time.time()
 
 
-def mock_fetch(router, password):
+def _mock_sessions(rid, now, kinds):
+    """Sesi simulasi: sebagian user keluar-masuk tiap ±90 detik supaya notifikasi bisa dicoba."""
+    spec = {"pppoe": ("cust-%03d", 14, 8, "pppoe"), "hotspot": ("tamu%d", 8, 7, "hotspot"), "vpn": ("vpn-%d", 3, 10, "l2tp")}
+    out = {}
+    for k in kinds:
+        pat, n, pct, svc = spec[k]
+        rows = []
+        for i in range(1, n + 1):
+            name = pat % i
+            if random.Random(f"{rid}-{name}-{int(now // 90)}").randint(1, 10) <= pct:
+                rows.append({"name": name, "address": f"10.{rid}.{k == 'hotspot' and 50 or 20}.{i + 10}",
+                             "caller": "AA:BB:CC:%02X:%02X:%02X" % (rid, i, 7), "uptime": "%dm%ds" % (i * 3, i), "service": svc})
+        out[k] = rows
+    return out
+
+
+def mock_fetch(router, password, sess_kinds=()):
     rid = router["id"]
     host = router["host"]
     now = time.time()
@@ -333,7 +380,7 @@ def mock_fetch(router, password):
         "temp": 41 + wave * 12 + rid % 6 + (28 if host.startswith("demo-hot") else 0),
         "volt": 24.0 + rnd.uniform(-0.1, 0.1),
         "uptime": int(now - _BOOT) + rid * 86400 * 3,
-        "ifaces": ifaces,
+        "ifaces": ifaces, "sessions": _mock_sessions(rid, now, sess_kinds),
         "ppp": rid % 4, "dhcp": int(20 + wave * 40 + rid * 3 % 20), "wifi": int(5 + wave * 25), "conn": int(2000 + wave * 6000 + rid * 100),
         "info": {"identity": router["name"], "version": "7.15.2 (stable)", "board": "RB4011iGS+" if rid % 2 else "hAP ax3",
                  "model": "RB4011iGS+5HacQ2HnD" if rid % 2 else "C53UiG+5HPaxD2HPaxD", "arch": "arm64" if rid % 2 else "arm",

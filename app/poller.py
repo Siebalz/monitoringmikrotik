@@ -1,4 +1,4 @@
-import json, time, threading, logging
+import json, re, time, threading, logging
 from concurrent.futures import ThreadPoolExecutor
 from . import db, ros, telegram as tg
 from .security import dec
@@ -16,10 +16,15 @@ WAN_TYPES = {"ether", "pppoe-out", "lte", "wlan", "wifi", "l2tp-out", "sstp-out"
 EMOJI = {"critical": "🔴", "warning": "🟠", "ok": "🟢", "info": "ℹ️"}
 
 
-def _fetch(router):
+def _sess_kinds(s):
+    return tuple(k for k in ("pppoe", "hotspot", "vpn") if s.get(f"sess_{k}", "off") != "off")
+
+
+def _fetch(router, s=None):
+    kinds = _sess_kinds(s or db.get_settings())
     if router["host"].startswith("demo") or (DEMO and router["host"].startswith("demo")):
-        return ros.mock_fetch(router, "")
-    return ros.fetch(router, dec(router["password_enc"]))
+        return ros.mock_fetch(router, "", kinds)
+    return ros.fetch(router, dec(router["password_enc"]), kinds)
 
 
 # ------------------------------------------------------------------ alerts
@@ -118,6 +123,100 @@ def evaluate(r, st, d, s, info_changed_reboot):
             db.ex("DELETE FROM alert_state WHERE router_id=? AND key=?", (r["id"], a["key"]))
 
 
+# ------------------------------------------------------------------ sesi PPPoE / Hotspot / VPN
+import fnmatch
+
+_SESS_LABEL = {"pppoe": ("🟢", "🔴", "PPPoE"), "hotspot": ("📶", "📴", "Hotspot"), "vpn": ("🔐", "🔓", "VPN")}
+
+
+def _patterns(s):
+    return [p.strip().lower() for p in re.split(r"[,\n;]+", s.get("sess_watch") or "") if p.strip()]
+
+
+def _wanted(mode, name, pats):
+    if mode == "all":
+        return True
+    return mode == "watch" and any(fnmatch.fnmatchcase(name.lower(), p) for p in pats)
+
+
+def process_sessions(r, d, s, now=None):
+    """Bandingkan sesi aktif dengan poll sebelumnya -> event + notifikasi login/putus.
+    - poll pertama (per router & jenis) hanya mencatat baseline, tanpa notifikasi
+    - putus baru diumumkan setelah hilang `sess_grace_polls` poll berturut-turut (anti-flapping)
+    - banyak sesi berubah sekaligus diringkas jadi 1 pesan (mis. uplink/OLT bermasalah)"""
+    now = int(now or time.time())
+    rid = r["id"]
+    sess = (d or {}).get("sessions") or {}
+    head = f"<b>{tg.esc(r['name'])}</b> ({tg.esc(r['host'])})"
+    grace = max(1, int(s["sess_grace_polls"]))
+    mass = max(2, int(s["sess_mass_drop"]))
+    pats = _patterns(s)
+    notify_on = bool(r["alerts_enabled"])
+    for kind in ("pppoe", "hotspot", "vpn"):
+        mode = s.get(f"sess_{kind}", "off")
+        if mode == "off":                                        # dimatikan: buang catatan lama supaya tak muncul 'putus' palsu saat diaktifkan lagi
+            if db.q1("SELECT 1 FROM sess_seed WHERE router_id=? AND kind=?", (rid, kind)):
+                db.ex("DELETE FROM sessions WHERE router_id=? AND kind=?", (rid, kind))
+                db.ex("DELETE FROM sess_seed WHERE router_id=? AND kind=?", (rid, kind))
+            continue
+        cur = sess.get(kind)
+        if cur is None:                                          # gagal ambil data -> jangan diff
+            continue
+        seeded = bool(db.q1("SELECT 1 FROM sess_seed WHERE router_id=? AND kind=?", (rid, kind)))
+        key = (lambda x: f"{x['name']}|{x['caller']}") if kind == "hotspot" else (lambda x: x["name"])
+        curmap = {key(x): x for x in cur}
+        prev = {x["skey"]: x for x in db.q("SELECT * FROM sessions WHERE router_id=? AND kind=?", (rid, kind))}
+        ups, downs = [], []
+        c = db.conn()
+        for k, x in curmap.items():
+            if k in prev:
+                c.execute("UPDATE sessions SET address=?, caller=?, uptime=?, last_seen=?, miss=0 WHERE router_id=? AND kind=? AND skey=?",
+                          (x["address"], x["caller"], x["uptime"], now, rid, kind, k))
+            else:
+                first = now - ros.parse_dur(x["uptime"]) if x["uptime"] else now
+                c.execute("INSERT OR REPLACE INTO sessions(router_id,kind,skey,name,address,caller,uptime,first_seen,last_seen,miss) VALUES(?,?,?,?,?,?,?,?,?,0)",
+                          (rid, kind, k, x["name"], x["address"], x["caller"], x["uptime"], first, now))
+                ups.append(x)
+        for k, p in prev.items():
+            if k in curmap:
+                continue
+            if p["miss"] + 1 >= grace:
+                c.execute("DELETE FROM sessions WHERE router_id=? AND kind=? AND skey=?", (rid, kind, k))
+                downs.append(p)
+            else:
+                c.execute("UPDATE sessions SET miss=miss+1 WHERE router_id=? AND kind=? AND skey=?", (rid, kind, k))
+        c.execute("INSERT OR IGNORE INTO sess_seed(router_id,kind) VALUES(?,?)", (rid, kind))
+        c.commit()
+        if not seeded:
+            continue                                             # baseline pertama: tanpa notifikasi
+        ups = [x for x in ups if _wanted(mode, x["name"], pats)] if s["sess_notify_login"] else []
+        downs = [x for x in downs if _wanted(mode, x["name"], pats)]
+        icon_up, icon_dn, label = _SESS_LABEL[kind]
+        for lst, is_up in ((ups, True), (downs, False)):
+            if not lst:
+                continue
+            verb = "tersambung" if is_up else "putus"
+            if len(lst) >= mass:
+                names = ", ".join(x["name"] for x in lst[:10]) + (f" (+{len(lst) - 10} lainnya)" if len(lst) > 10 else "")
+                db.add_event("warning" if not is_up else "info", "session", f"{len(lst)} sesi {label} {verb} bersamaan: {names}", rid, r["name"])
+                if notify_on:
+                    ttl = f"{icon_up} <b>{len(lst)} sesi {label} tersambung kembali</b>" if is_up else f"⚠️ <b>{len(lst)} sesi {label} putus bersamaan</b>"
+                    note = "" if is_up else "\nKemungkinan gangguan uplink/perangkat di router ini."
+                    tg.notify(r, "session", f"{ttl}\n{head}\n<code>{tg.esc(names)}</code>{note}", s)
+                continue
+            for x in lst:
+                if is_up:
+                    msg = f"{label} {x['name']} tersambung" + (f" ({x['address']})" if x["address"] else "")
+                    text = f"{icon_up} <b>{label} tersambung</b>\n{head}\nUser: <code>{tg.esc(x['name'])}</code>" + (f"\nIP: {tg.esc(x['address'])}" if x["address"] else "")
+                else:
+                    dur = tg.fmt_dur(max(0, now - x["first_seen"]))
+                    msg = f"{label} {x['name']} putus (online {dur})"
+                    text = f"{icon_dn} <b>{label} putus</b>\n{head}\nUser: <code>{tg.esc(x['name'])}</code>\nOnline selama {dur}" + (f"\nIP terakhir: {tg.esc(x['address'])}" if x["address"] else "")
+                db.add_event("info" if is_up else "warning", "session", msg, rid, r["name"])
+                if notify_on:
+                    tg.notify(r, "session", text, s)
+
+
 # ------------------------------------------------------------------ polling
 def poll_router(r, s=None):
     s = s or db.get_settings()
@@ -125,7 +224,7 @@ def poll_router(r, s=None):
     now = int(time.time())
     d, err = None, ""
     try:
-        d = _fetch(r)
+        d = _fetch(r, s)
     except Exception as e:
         err = str(e)[:300]
     old = db.q1("SELECT * FROM router_state WHERE router_id=?", (rid,)) or {}
@@ -195,6 +294,11 @@ def poll_router(r, s=None):
         evaluate(r, st, d, s, reboot)
     except Exception:
         log.exception("evaluate %s", r["name"])
+    if d:
+        try:
+            process_sessions(r, d, s, now)
+        except Exception:
+            log.exception("sessions %s", r["name"])
     return st
 
 

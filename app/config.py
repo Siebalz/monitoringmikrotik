@@ -28,4 +28,4 @@ def _secret():
 SECRET_KEY = _secret()
 FERNET_KEY = base64.urlsafe_b64encode(hashlib.sha256(("fernet:" + SECRET_KEY).encode()).digest())
 
-APP_VERSION = "2026.10.25-portal"   # tampil di sidebar & /healthz untuk memastikan versi yang berjalan
+APP_VERSION = "2026.10.26-sesi"   # tampil di sidebar & /healthz untuk memastikan versi yang berjalan
