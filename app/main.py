@@ -643,6 +643,12 @@ def vpn_user_script(sid: int, secret_id: str):
     return {"script": _vpn_call(vpn.get_script, srv, secret_id, db.get_settings())}
 
 
+@app.get("/api/vpn/servers/{sid}/users/{secret_id}/watchdog", dependencies=[Depends(auth)])
+def vpn_user_watchdog(sid: int, secret_id: str):
+    srv = _vpn_server(sid)
+    return {"script": _vpn_call(vpn.get_watchdog_script, srv, secret_id, db.get_settings())}
+
+
 @app.post("/api/vpn/servers/{sid}/cleanup", dependencies=[Depends(auth)])
 def vpn_cleanup(sid: int, request: Request):
     srv = _vpn_server(sid)

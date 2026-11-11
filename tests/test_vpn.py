@@ -42,6 +42,18 @@ with TestClient(main.app) as c:
     assert d["summary"] == {"total": 2, "online": 1, "disabled": 0} and b["online"] and b["rx"] == 1000 and len(b["access"]) == 4 and b["router_id"], d
     # script ulang
     assert "p\\\"w\\$1" in c.get(f"/api/vpn/servers/{sid}/users/{b['id']}/script").json()["script"]
+    # watchdog: ikut di script client, satu baris per perintah (tanpa newline mentah di dalam source="...")
+    cs = r["client_script"]
+    assert "/system scheduler add name=vpn-watchdog interval=60s" in cs and "budi-vpn" in cs, cs
+    src_line = next(l for l in cs.split("\n") if l.startswith("/system script add name=vpn-watchdog"))
+    assert "\\n" in src_line and "\\$c" in src_line and src_line.endswith('"'), src_line
+    wd = c.get(f"/api/vpn/servers/{sid}/users/{b['id']}/watchdog").json()["script"]
+    assert "/interface l2tp-client" in wd and "/ppp/secret" not in wd and "l2tp-client add" not in wd, wd
+    c.put("/api/settings", json={"vpn_watchdog": False})
+    assert "vpn-watchdog" not in c.get(f"/api/vpn/servers/{sid}/users/{b['id']}/script").json()["script"]
+    c.put("/api/settings", json={"vpn_watchdog": True, "vpn_watchdog_interval": 5})
+    assert "interval=10s" in c.get(f"/api/vpn/servers/{sid}/users/{b['id']}/watchdog").json()["script"]   # minimal 10
+    c.put("/api/settings", json={"vpn_watchdog_interval": 60})
     # nonaktifkan
     assert c.post(f"/api/vpn/servers/{sid}/users/{b['id']}/toggle", json={"disabled": True}).status_code == 200
     assert next(u for u in c.get(f"/api/vpn/servers/{sid}/users").json()["users"] if u["name"] == "budi")["disabled"]

@@ -42,6 +42,8 @@ DEFAULT_SETTINGS = {
     "vpn_nat_port_min": 20000,  # rentang port publik untuk port-forward
     "vpn_nat_port_max": 60000,
     "vpn_services": "Winbox:8291,API:8728,WebFig:80,HTTPS:2000",   # Label:port-di-client
+    "vpn_watchdog": True,       # script client menyertakan watchdog (auto-reconnect L2TP)
+    "vpn_watchdog_interval": 60,  # detik antar pengecekan tunnel (minimal 10)
     "vpn_monitor_address": "",  # sumber yang boleh akses API di router client (kosong = subnet VPN /24)
 }
 
