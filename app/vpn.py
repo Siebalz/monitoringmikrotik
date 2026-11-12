@@ -50,8 +50,57 @@ def subnet_cidr(prefix):
     return f"{p}.0/24" if p.count(".") == 2 else ""
 
 
-def client_script(server, username, password, monitor_pw=None, monitor_addr=""):
-    conn = re.sub(r"[^a-zA-Z0-9_-]", "", username) + "-vpn"
+def conn_name(username):
+    return re.sub(r"[^a-zA-Z0-9_-]", "", username) + "-vpn"
+
+
+def wd_interval(s):
+    """Interval watchdog (detik) dari pengaturan; 0 = watchdog mati."""
+    if not s.get("vpn_watchdog", True):
+        return 0
+    return max(10, int(s.get("vpn_watchdog_interval") or 60))
+
+
+def watchdog_script(conn, interval=60):
+    """Script RouterOS: cek tunnel L2TP client tiap `interval` detik dan sambungkan ulang bila putus/macet.
+
+    Dianggap bermasalah bila: client dinonaktifkan, tidak 'running', atau running tetapi
+    ujung tunnel (IP server di dalam VPN) tidak membalas ping. Perbaikan = disable lalu enable.
+    """
+    src = "\n".join([
+        f':local c "{conn}"',
+        ':local i [/interface l2tp-client find name=$c]',
+        ':if ([:len $i]=0) do={:error "vpn-watchdog: client $c tidak ada"}',
+        ':local bad false',
+        ':if ([/interface l2tp-client get $i disabled]) do={:set bad true}',
+        ':if (!$bad) do={',
+        '  :if (![/interface l2tp-client get $i running]) do={:set bad true} else={',
+        '    :local gw ""',
+        '    :do {:set gw [/ip address get [/ip address find interface=$c] network]} on-error={}',
+        '    :if ($gw!="") do={:if ([/ping $gw count=3 interval=1s]=0) do={:set bad true}}',
+        '  }',
+        '}',
+        ':if ($bad) do={',
+        '  :log warning "vpn-watchdog: $c putus/macet, menyambung ulang"',
+        '  /interface l2tp-client disable $i',
+        '  :delay 3s',
+        '  /interface l2tp-client enable $i',
+        '}',
+    ])
+    # escape per baris; pemisah baris ditulis sebagai \\n (escape RouterOS) agar aman ditempel di terminal
+    src = "\\n".join(ros_esc(l) for l in src.split("\n"))
+    return "\n".join([
+        "# --- watchdog VPN: sambungkan ulang otomatis bila tunnel putus/macet ---",
+        ':do { /system script remove [find name=vpn-watchdog] } on-error={}',
+        ':do { /system scheduler remove [find name=vpn-watchdog] } on-error={}',
+        f'/system script add name=vpn-watchdog policy=read,write,test source="{src}"',
+        f'/system scheduler add name=vpn-watchdog interval={int(interval)}s start-time=startup '
+        f'on-event=vpn-watchdog policy=read,write,test',
+    ])
+
+
+def client_script(server, username, password, monitor_pw=None, monitor_addr="", watchdog=0):
+    conn = conn_name(username)
     lines = [f'/interface l2tp-client add name={conn} connect-to={server["public_ip"] or server["host"]} '
              f'user="{ros_esc(username)}" password="{ros_esc(password)}" disabled=no']
     if monitor_pw:
@@ -63,6 +112,8 @@ def client_script(server, username, password, monitor_pw=None, monitor_addr=""):
             f'/user add name=monitor group=monitor password="{ros_esc(monitor_pw)}"{a}',
             f"/ip service set api disabled=no{a}",
         ]
+    if watchdog:
+        lines.append(watchdog_script(conn, watchdog))
     return "\n".join(lines)
 
 
@@ -188,7 +239,7 @@ def create_user(server, username, password, profile, services, s, monitor=False,
                      group or f"VPN {server['name']}", f"Dibuat dari VPN {server['name']}", int(time.time())))
         res["router_id"], res["monitor_password"] = cur.lastrowid, mpw
         db.ex("INSERT OR REPLACE INTO vpn_links VALUES(?,?,?)", (server["id"], username, cur.lastrowid))
-    res["client_script"] = client_script(server, username, password, res["monitor_password"], s["vpn_monitor_address"])
+    res["client_script"] = client_script(server, username, password, res["monitor_password"], s["vpn_monitor_address"], wd_interval(s))
     return res
 
 
@@ -275,4 +326,16 @@ def get_script(server, secret_id, s):
     if lk:
         r = db.q1("SELECT password_enc FROM routers WHERE id=?", (lk["router_id"],))
         mpw = dec(r["password_enc"]) if r else None
-    return client_script(server, u["name"], u.get("password", ""), mpw, s["vpn_monitor_address"])
+    return client_script(server, u["name"], u.get("password", ""), mpw, s["vpn_monitor_address"], wd_interval(s))
+
+
+def get_watchdog_script(server, secret_id, s):
+    """Watchdog saja (tanpa membuat ulang l2tp-client) untuk router lama yang sudah terpasang."""
+    c = connect(server)
+    try:
+        sec, _ = c.call("/ppp/secret/print", queries=[f"?.id={secret_id}"])
+    finally:
+        c.close()
+    if not sec:
+        raise VpnError("User tidak ditemukan.")
+    return watchdog_script(conn_name(sec[0]["name"]), wd_interval(s) or max(10, int(s.get("vpn_watchdog_interval") or 60)))

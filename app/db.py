@@ -42,7 +42,19 @@ DEFAULT_SETTINGS = {
     "vpn_nat_port_min": 20000,  # rentang port publik untuk port-forward
     "vpn_nat_port_max": 60000,
     "vpn_services": "Winbox:8291,API:8728,WebFig:80,HTTPS:2000",   # Label:port-di-client
+    "vpn_watchdog": True,       # script client menyertakan watchdog (auto-reconnect L2TP)
+    "vpn_watchdog_interval": 60,  # detik antar pengecekan tunnel (minimal 10)
     "vpn_monitor_address": "",  # sumber yang boleh akses API di router client (kosong = subnet VPN /24)
+    # --- Hotspot / Mikhmon online ---
+    "hs_sync_interval": 60,     # detik antar sinkron voucher (deteksi terpakai + hapus yang kedaluwarsa)
+    # --- Cloudflare Tunnel (publish portal per klien lewat subdomain) ---
+    "cf_enabled": False,
+    "cf_token": "",             # disimpan terenkripsi (Fernet)
+    "cf_account_id": "",
+    "cf_zone_id": "",
+    "cf_tunnel_id": "",
+    "cf_base_domain": "",       # mis. pantau.domainanda.com -> klien: nama.pantau.domainanda.com
+    "cf_service": "http://monitor:8080",   # alamat web Pantau dilihat dari container cloudflared
 }
 
 SCHEMA = """
@@ -139,6 +151,21 @@ CREATE TABLE IF NOT EXISTS vpn_servers(
   profile TEXT NOT NULL DEFAULT 'default',
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS hs_vouchers(    -- voucher hotspot yang dibuat lewat Pantau (dasar laporan penjualan)
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  router_id INTEGER NOT NULL, batch TEXT NOT NULL DEFAULT '', username TEXT NOT NULL, password TEXT NOT NULL DEFAULT '',
+  profile TEXT NOT NULL DEFAULT '', price INTEGER NOT NULL DEFAULT 0, validity TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,
+  used_at INTEGER,                         -- pertama kali terlihat dipakai (= terjual)
+  expires_at INTEGER,                      -- used_at + validity (masa aktif sejak pertama dipakai)
+  removed INTEGER NOT NULL DEFAULT 0,      -- sudah dihapus dari router
+  UNIQUE(router_id, username)
+);
+CREATE INDEX IF NOT EXISTS ix_hsv_used ON hs_vouchers(router_id, used_at);
+CREATE TABLE IF NOT EXISTS hs_profile_meta(  -- harga & masa aktif per profile (RouterOS tidak punya kolom ini)
+  router_id INTEGER NOT NULL, profile TEXT NOT NULL, price INTEGER NOT NULL DEFAULT 0, validity TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(router_id, profile)
+);
 CREATE TABLE IF NOT EXISTS vpn_links(      -- user VPN yang otomatis didaftarkan ke monitoring
   server_id INTEGER NOT NULL, username TEXT NOT NULL, router_id INTEGER NOT NULL,
   PRIMARY KEY(server_id, username)
@@ -164,6 +191,17 @@ def init():
         c.execute("ALTER TABLE latency ADD COLUMN err TEXT NOT NULL DEFAULT ''")
     except Exception:
         pass
+    for stmt in ("ALTER TABLE routers ADD COLUMN hs_enabled INTEGER NOT NULL DEFAULT 0",
+                 "ALTER TABLE routers ADD COLUMN hs_user TEXT NOT NULL DEFAULT ''",
+                 "ALTER TABLE routers ADD COLUMN hs_password_enc TEXT NOT NULL DEFAULT ''",
+                 "ALTER TABLE routers ADD COLUMN hs_dns TEXT NOT NULL DEFAULT ''",
+                 "ALTER TABLE users ADD COLUMN hotspot_access INTEGER NOT NULL DEFAULT 0",
+                 "ALTER TABLE users ADD COLUMN subdomain TEXT NOT NULL DEFAULT ''",
+                 "ALTER TABLE users ADD COLUMN cf_record_id TEXT NOT NULL DEFAULT ''"):
+        try:                               # migrasi: kolom baru untuk Hotspot & Cloudflare
+            c.execute(stmt)
+        except Exception:
+            pass
     c.commit()
 
 

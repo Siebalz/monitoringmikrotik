@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import db, poller, ros, telegram as tg, demo, vpn, diag, latency
+from . import db, poller, ros, telegram as tg, demo, vpn, diag, latency, hotspot, cloudflare
 from .config import ADMIN_USER, ADMIN_PASSWORD, SECRET_KEY, DEMO, COOKIE_SECURE, APP_VERSION
 from .security import enc, dec, hash_password, verify_password, _DUMMY
 
@@ -25,6 +25,7 @@ async def lifespan(app):
         logging.warning("ADMIN_PASSWORD masih default 'admin' — segera ganti di .env!")
     poller.start()
     latency.start()
+    hotspot.start()
     tg.start_bot()
     yield
 
@@ -49,11 +50,12 @@ def _ctx(request: Request):
     if not u:
         raise HTTPException(401, "Belum login")
     if (request.session.get("role") or "admin") == "client":
-        row = db.q1("SELECT id, username, display_name, enabled FROM users WHERE id=? AND role='client'", (request.session.get("uid"),))
+        row = db.q1("SELECT id, username, display_name, enabled, hotspot_access, subdomain FROM users WHERE id=? AND role='client'", (request.session.get("uid"),))
         if not row or not row["enabled"]:          # dinonaktifkan/dihapus -> langsung tertendang
             request.session.clear()
             raise HTTPException(401, "Akun tidak aktif")
-        return {"role": "client", "uid": row["id"], "username": row["username"], "name": row["display_name"] or row["username"]}
+        return {"role": "client", "uid": row["id"], "username": row["username"], "name": row["display_name"] or row["username"],
+                "hotspot": bool(row["hotspot_access"]), "subdomain": row["subdomain"]}
     return {"role": "admin", "uid": None, "username": u, "name": u}
 
 
@@ -103,6 +105,21 @@ def _client_view(r):
 _fails = {}
 
 
+def _host(request: Request):
+    return (request.headers.get("host") or "").split(":")[0].strip().lower()
+
+
+def tenant_for_host(request: Request):
+    """Host di bawah *.cf_base_domain = portal milik satu klien. Return (is_tenant_host, user_row_or_None)."""
+    s = db.get_settings()
+    base = cloudflare.norm_base(s["cf_base_domain"]) if s["cf_enabled"] else ""
+    h = _host(request)
+    if not base or not h.endswith("." + base):
+        return False, None
+    sub = h[: -(len(base) + 1)]
+    return True, db.q1("SELECT * FROM users WHERE subdomain=? AND role='client' AND subdomain!=''", (sub,))
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -110,13 +127,21 @@ class LoginIn(BaseModel):
 
 @app.post("/api/login")
 def login(body: LoginIn, request: Request):
+    is_tenant, tenant = tenant_for_host(request)
     ip = request.client.host if request.client else "?"
+    if is_tenant and request.headers.get("cf-connecting-ip"):      # lewat Cloudflare Tunnel: IP asli pengunjung, bukan IP cloudflared
+        ip = request.headers["cf-connecting-ip"].strip()[:45]
     f = _fails.get(ip, (0, 0))
     if f[0] >= 5 and time.time() - f[1] < 60:
         raise HTTPException(429, "Terlalu banyak percobaan. Coba lagi 1 menit.")
     uname = body.username.strip()
     role, uid = None, None
-    if hmac.compare_digest(uname.encode(), ADMIN_USER.encode()) & hmac.compare_digest(body.password.encode(), ADMIN_PASSWORD.encode()):
+    if is_tenant:                       # portal publik per klien: hanya akun klien itu; admin tidak bisa masuk dari sini
+        u = db.q1("SELECT * FROM users WHERE username=? AND role='client'", (uname,))
+        good = verify_password(body.password, u["password_hash"] if u else _DUMMY)
+        if u and good and u["enabled"] and tenant and u["id"] == tenant["id"]:
+            role, uid = "client", u["id"]
+    elif hmac.compare_digest(uname.encode(), ADMIN_USER.encode()) & hmac.compare_digest(body.password.encode(), ADMIN_PASSWORD.encode()):
         role = "admin"
     else:
         u = db.q1("SELECT * FROM users WHERE username=? AND role='client'", (uname,))
@@ -144,11 +169,15 @@ def logout(request: Request):
 @app.get("/api/me")
 def me(request: Request):
     brand = db.get_settings()["brand_name"]
+    is_tenant, tenant = tenant_for_host(request)
+    if is_tenant and tenant and (tenant["display_name"] or "").strip():
+        brand = tenant["display_name"].strip()           # white-label: nama klien tampil di portalnya
     try:
         c = _ctx(request)
     except HTTPException:
         return {"user": None, "demo": DEMO, "brand": brand, "version": APP_VERSION}
-    return {"user": c["username"], "name": c["name"], "role": c["role"], "demo": DEMO, "brand": brand, "version": APP_VERSION}
+    return {"user": c["username"], "name": c["name"], "role": c["role"], "demo": DEMO, "brand": brand, "version": APP_VERSION,
+            "hotspot": True if c["role"] == "admin" else c["hotspot"]}
 
 
 @app.get("/")
@@ -156,7 +185,7 @@ def index():
     """Halaman utama. URL app.js/style.css diberi ?v=<versi+waktu-ubah> sehingga browser PASTI mengambil file terbaru setelah update."""
     with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as f:
         html = f.read()
-    for name in ("app.js", "style.css"):
+    for name in ("app.js", "hotspot.js", "style.css"):
         try:
             v = f"{APP_VERSION}-{int(os.path.getmtime(os.path.join(STATIC, name)))}"
         except OSError:
@@ -386,6 +415,8 @@ def delete_router(rid: int):
     for t in ("routers", "router_state", "metrics", "iface_metrics", "alert_state", "watched_ifaces", "sessions", "sess_seed"):
         db.ex(f"DELETE FROM {t} WHERE {'id' if t == 'routers' else 'router_id'}=?", (rid,))
     db.ex("DELETE FROM user_routers WHERE router_id=?", (rid,))
+    db.ex("DELETE FROM hs_vouchers WHERE router_id=?", (rid,))
+    db.ex("DELETE FROM hs_profile_meta WHERE router_id=?", (rid,))
     return {"ok": True}
 
 
@@ -437,6 +468,7 @@ def _settings_public():
     tok = s.pop("tg_token", "")
     s["tg_token_set"] = bool(tok)
     s["tg_token_hint"] = ("•••• " + tok[-4:]) if tok else ""
+    s["cf_token_set"] = bool(s.pop("cf_token", ""))
     return s
 
 
@@ -455,6 +487,14 @@ def put_settings(body: dict):
             if not v:
                 continue
             v = str(v).strip()
+        elif k == "cf_token":
+            if not v:
+                continue                       # kosong = pertahankan token lama
+            v = enc(str(v).strip())
+        elif k in ("cf_account_id", "cf_zone_id", "cf_tunnel_id"):
+            v = re.sub(r"[^0-9A-Za-z-]", "", str(v))
+        elif k == "cf_base_domain":
+            v = cloudflare.norm_base(v)
         elif isinstance(db.DEFAULT_SETTINGS[k], bool):
             v = bool(v)
         elif isinstance(db.DEFAULT_SETTINGS[k], (int, float)):
@@ -468,6 +508,8 @@ def put_settings(body: dict):
         clean[k] = v
     if body.get("tg_token_clear"):
         clean["tg_token"] = ""
+    if body.get("cf_token_clear"):
+        clean["cf_token"] = ""
     db.save_settings(clean)
     return _settings_public()
 
@@ -643,6 +685,12 @@ def vpn_user_script(sid: int, secret_id: str):
     return {"script": _vpn_call(vpn.get_script, srv, secret_id, db.get_settings())}
 
 
+@app.get("/api/vpn/servers/{sid}/users/{secret_id}/watchdog", dependencies=[Depends(auth)])
+def vpn_user_watchdog(sid: int, secret_id: str):
+    srv = _vpn_server(sid)
+    return {"script": _vpn_call(vpn.get_watchdog_script, srv, secret_id, db.get_settings())}
+
+
 @app.post("/api/vpn/servers/{sid}/cleanup", dependencies=[Depends(auth)])
 def vpn_cleanup(sid: int, request: Request):
     srv = _vpn_server(sid)
@@ -800,11 +848,17 @@ def _norm_chats(s):
     return ",".join(dict.fromkeys(ids))
 
 
+def _portal_url(sub):
+    base = cloudflare.norm_base(db.get_settings()["cf_base_domain"])
+    return f"https://{sub}.{base}" if base else ""
+
+
 def _user_row(u):
     ids = [r["router_id"] for r in db.q("SELECT router_id FROM user_routers WHERE user_id=?", (u["id"],))]
     return {"id": u["id"], "username": u["username"], "display_name": u["display_name"], "enabled": bool(u["enabled"]),
             "tg_chat_ids": u["tg_chat_ids"], "notify": u["notify"], "last_login": u["last_login"], "created_at": u["created_at"],
-            "router_ids": ids}
+            "router_ids": ids, "hotspot_access": bool(u["hotspot_access"]), "subdomain": u["subdomain"],
+            "url": _portal_url(u["subdomain"]) if u["subdomain"] else ""}
 
 
 class UserIn(BaseModel):
@@ -815,6 +869,7 @@ class UserIn(BaseModel):
     tg_chat_ids: str = ""
     notify: str = "all"
     router_ids: list[int] = []
+    hotspot_access: bool = False
 
 
 def _check_user_in(b: UserIn):
@@ -852,9 +907,9 @@ def users_add(b: UserIn, request: Request):
         raise HTTPException(400, "Password minimal 8 karakter")
     ids, chats = _check_user_in(b)
     pw = b.password or vpn.gen_password(14)
-    cur = db.ex("""INSERT INTO users(username,display_name,password_hash,role,enabled,tg_chat_ids,notify,created_at)
-                   VALUES(?,?,?,'client',?,?,?,?)""",
-                (uname, b.display_name.strip()[:80], hash_password(pw), int(b.enabled), chats, b.notify, int(time.time())))
+    cur = db.ex("""INSERT INTO users(username,display_name,password_hash,role,enabled,tg_chat_ids,notify,created_at,hotspot_access)
+                   VALUES(?,?,?,'client',?,?,?,?,?)""",
+                (uname, b.display_name.strip()[:80], hash_password(pw), int(b.enabled), chats, b.notify, int(time.time()), int(b.hotspot_access)))
     _set_links(cur.lastrowid, ids)
     _audit(request, f"Akun klien dibuat: {uname} ({len(ids)} router)")
     return {"id": cur.lastrowid, "username": uname, "password": pw}
@@ -876,8 +931,8 @@ def users_update(uid: int, b: UserIn, request: Request):
         if len(b.password) < 8:
             raise HTTPException(400, "Password minimal 8 karakter")
         pw_new = b.password
-    db.ex("UPDATE users SET username=?, display_name=?, enabled=?, tg_chat_ids=?, notify=? WHERE id=?",
-          (uname, b.display_name.strip()[:80], int(b.enabled), chats, b.notify, uid))
+    db.ex("UPDATE users SET username=?, display_name=?, enabled=?, tg_chat_ids=?, notify=?, hotspot_access=? WHERE id=?",
+          (uname, b.display_name.strip()[:80], int(b.enabled), chats, b.notify, int(b.hotspot_access), uid))
     if pw_new:
         db.ex("UPDATE users SET password_hash=? WHERE id=?", (hash_password(pw_new), uid))
     _set_links(uid, ids)
@@ -890,6 +945,11 @@ def users_delete(uid: int, request: Request):
     u = db.q1("SELECT * FROM users WHERE id=? AND role='client'", (uid,))
     if not u:
         raise HTTPException(404, "Akun tidak ditemukan")
+    if u["subdomain"] and cloudflare.ready():
+        try:
+            cloudflare.unpublish(u["subdomain"], u["cf_record_id"])
+        except cloudflare.CfError as e:
+            _audit(request, f"Gagal hapus DNS {u['subdomain']}: {e}")
     db.ex("DELETE FROM user_routers WHERE user_id=?", (uid,))
     db.ex("DELETE FROM users WHERE id=?", (uid,))
     _audit(request, f"Akun klien dihapus: {u['username']}")
@@ -994,3 +1054,266 @@ def router_sessions(rid: int, request: Request):
         counts[r["kind"]] = counts.get(r["kind"], 0) + 1
     return {"rows": rows[:1500], "counts": counts, "total": len(rows), "now": int(time.time()),
             "enabled": [k for k in ("pppoe", "hotspot", "vpn") if st[f"sess_{k}"] != "off"]}
+
+
+# ------------------------------------------------------------------ Cloudflare Tunnel: publish portal per klien
+def _cf_call(fn, *a, **kw):
+    try:
+        return fn(*a, **kw)
+    except cloudflare.CfError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/cloudflare/test", dependencies=[Depends(auth)])
+def cf_test():
+    return _cf_call(cloudflare.test)
+
+
+@app.post("/api/cloudflare/apply", dependencies=[Depends(auth)])
+def cf_apply(request: Request):
+    c = cloudflare.cfg()
+    _cf_call(cloudflare.test, c)
+    ing = _cf_call(cloudflare.apply_ingress, c)
+    _audit(request, f"Cloudflare: ingress tunnel diterapkan (*.{c['cf_base_domain']} -> {c['cf_service']})")
+    return {"ok": True, "ingress": ing}
+
+
+class PublishIn(BaseModel):
+    subdomain: str
+
+
+@app.post("/api/users/{uid}/publish", dependencies=[Depends(auth)])
+def user_publish(uid: int, b: PublishIn, request: Request):
+    u = db.q1("SELECT * FROM users WHERE id=? AND role='client'", (uid,))
+    if not u:
+        raise HTTPException(404, "Akun tidak ditemukan")
+    if not cloudflare.ready():
+        raise HTTPException(400, "Cloudflare belum diaktifkan/lengkap di Pengaturan.")
+    sub = _cf_call(cloudflare.check_sub, b.subdomain)
+    if db.q1("SELECT 1 FROM users WHERE subdomain=? AND id!=?", (sub, uid)):
+        raise HTTPException(400, "Subdomain sudah dipakai klien lain")
+    name, rec = _cf_call(cloudflare.publish, sub)
+    if u["subdomain"] and u["subdomain"] != sub:          # ganti nama: hapus record lama
+        try:
+            cloudflare.unpublish(u["subdomain"], u["cf_record_id"])
+        except cloudflare.CfError:
+            pass
+    db.ex("UPDATE users SET subdomain=?, cf_record_id=? WHERE id=?", (sub, rec, uid))
+    _audit(request, f"Portal klien {u['username']} dipublish: {name}")
+    return {"ok": True, "subdomain": sub, "url": f"https://{name}"}
+
+
+@app.delete("/api/users/{uid}/publish", dependencies=[Depends(auth)])
+def user_unpublish(uid: int, request: Request):
+    u = db.q1("SELECT * FROM users WHERE id=? AND role='client'", (uid,))
+    if not u:
+        raise HTTPException(404, "Akun tidak ditemukan")
+    if u["subdomain"]:
+        if cloudflare.ready():
+            _cf_call(cloudflare.unpublish, u["subdomain"], u["cf_record_id"])
+        db.ex("UPDATE users SET subdomain='', cf_record_id='' WHERE id=?", (uid,))
+        _audit(request, f"Publish portal klien {u['username']} dihentikan")
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ Hotspot / Mikhmon online
+def _hs_ctx(request: Request, rid: int):
+    """Admin: semua router. Klien: hanya router miliknya DAN bila akunnya diberi akses Hotspot. Selain itu 404."""
+    c = _ctx(request)
+    if c["role"] == "client":
+        ok = c["hotspot"] and rid in (scope(request) or [])
+        if not ok:
+            raise HTTPException(404, "Router tidak ditemukan")
+    r = _load(rid)
+    if not r["hs_enabled"] and c["role"] == "client":
+        raise HTTPException(404, "Router tidak ditemukan")
+    return c, r
+
+
+def _hs_call(fn, *a, **kw):
+    try:
+        return fn(*a, **kw)
+    except hotspot.HsError as e:
+        raise HTTPException(400, str(e))
+    except ros.RosError as e:
+        raise HTTPException(502, str(e))
+
+
+def _hs_router_view(r, admin):
+    v = {"id": r["id"], "name": r["name"], "group_name": r["group_name"], "hs_enabled": bool(r["hs_enabled"]), "hs_dns": r["hs_dns"]}
+    if admin:
+        v.update(hs_user=r["hs_user"], hs_has_password=bool(r["hs_password_enc"]), host=r["host"])
+    return v
+
+
+@app.get("/api/hotspot/routers", dependencies=[Depends(auth_any)])
+def hs_routers(request: Request):
+    c = _ctx(request)
+    rows = db.q("SELECT * FROM routers ORDER BY name")
+    if c["role"] == "client":
+        if not c["hotspot"]:
+            return []
+        sc = scope(request) or []
+        rows = [r for r in rows if r["id"] in sc and r["hs_enabled"]]
+    return [_hs_router_view(r, c["role"] == "admin") for r in rows]
+
+
+class HsConfIn(BaseModel):
+    hs_enabled: bool = False
+    hs_user: str = ""
+    hs_password: Optional[str] = None
+    hs_dns: str = ""
+
+
+@app.put("/api/hotspot/routers/{rid}/config", dependencies=[Depends(auth)])
+def hs_config(rid: int, b: HsConfIn, request: Request):
+    r = _load(rid)
+    pw = enc(b.hs_password) if b.hs_password else r["hs_password_enc"]
+    dns = re.sub(r"^https?://", "", b.hs_dns.strip().lower()).strip("/")[:100]
+    if dns and not re.match(r"^[a-z0-9.-]+$", dns):
+        raise HTTPException(400, "DNS name hotspot hanya huruf, angka, titik, minus")
+    db.ex("UPDATE routers SET hs_enabled=?, hs_user=?, hs_password_enc=?, hs_dns=? WHERE id=?",
+          (int(b.hs_enabled), b.hs_user.strip()[:60], pw, dns, rid))
+    _audit(request, f"Hotspot router {r['name']}: {'aktif' if b.hs_enabled else 'nonaktif'}")
+    return {"ok": True}
+
+
+@app.post("/api/hotspot/routers/{rid}/test", dependencies=[Depends(auth)])
+def hs_test(rid: int):
+    return _hs_call(hotspot.test, _load(rid))
+
+
+@app.get("/api/hotspot/routers/{rid}/profiles")
+def hs_profiles(rid: int, request: Request):
+    _, r = _hs_ctx(request, rid)
+    return _hs_call(hotspot.list_profiles, r)
+
+
+class HsProfileIn(BaseModel):
+    name: str
+    rate_limit: str = ""
+    shared_users: str = "1"
+    session_timeout: str = ""
+    idle_timeout: str = ""
+    price: int = 0
+    validity: str = ""
+
+
+@app.post("/api/hotspot/routers/{rid}/profiles")
+def hs_profile_add(rid: int, b: HsProfileIn, request: Request):
+    c, r = _hs_ctx(request, rid)
+    n = _hs_call(hotspot.save_profile, r, b.model_dump())
+    _audit(request, f"Hotspot {r['name']}: profile dibuat {n}")
+    return {"ok": True}
+
+
+@app.put("/api/hotspot/routers/{rid}/profiles/{pid}")
+def hs_profile_edit(rid: int, pid: str, b: HsProfileIn, request: Request):
+    c, r = _hs_ctx(request, rid)
+    n = _hs_call(hotspot.save_profile, r, b.model_dump(), pid)
+    _audit(request, f"Hotspot {r['name']}: profile diubah {n}")
+    return {"ok": True}
+
+
+@app.delete("/api/hotspot/routers/{rid}/profiles/{pid}")
+def hs_profile_del(rid: int, pid: str, request: Request):
+    c, r = _hs_ctx(request, rid)
+    n = _hs_call(hotspot.delete_profile, r, pid)
+    _audit(request, f"Hotspot {r['name']}: profile dihapus {n}")
+    return {"ok": True}
+
+
+@app.get("/api/hotspot/routers/{rid}/users")
+def hs_users(rid: int, request: Request, q: str = ""):
+    _, r = _hs_ctx(request, rid)
+    return _hs_call(hotspot.list_users, r, q)
+
+
+class HsActionIn(BaseModel):
+    action: str
+
+
+@app.post("/api/hotspot/routers/{rid}/users/{uid}/action")
+def hs_user_action(rid: int, uid: str, b: HsActionIn, request: Request):
+    c, r = _hs_ctx(request, rid)
+    n = _hs_call(hotspot.user_action, r, uid, b.action)
+    _audit(request, f"Hotspot {r['name']}: {b.action} user {n}")
+    return {"ok": True, "name": n}
+
+
+class HsRemoveIn(BaseModel):
+    names: list[str]
+
+
+@app.post("/api/hotspot/routers/{rid}/users/remove")
+def hs_users_remove(rid: int, b: HsRemoveIn, request: Request):
+    c, r = _hs_ctx(request, rid)
+    n = _hs_call(hotspot.remove_users, r, b.names)
+    _audit(request, f"Hotspot {r['name']}: {n} user/voucher dihapus")
+    return {"ok": True, "removed": n}
+
+
+class HsGenIn(BaseModel):
+    profile: str
+    qty: int = 10
+    mode: str = "vc"
+    length: int = 6
+    charset: str = "num"
+    prefix: str = ""
+    server: str = "all"
+    note: str = ""
+    limit_uptime: str = ""
+    limit_mb: int = 0
+
+
+@app.post("/api/hotspot/routers/{rid}/vouchers")
+def hs_generate(rid: int, b: HsGenIn, request: Request):
+    c, r = _hs_ctx(request, rid)
+    res = _hs_call(hotspot.generate, r, b.model_dump(), c["username"])
+    _audit(request, f"Hotspot {r['name']}: {res['count']} voucher {res['profile']} dibuat (batch {res['batch']})")
+    res["router_dns"] = r["hs_dns"]
+    return res
+
+
+@app.get("/api/hotspot/routers/{rid}/batches")
+def hs_batches(rid: int, request: Request):
+    _hs_ctx(request, rid)
+    return hotspot.list_batches(rid)
+
+
+@app.get("/api/hotspot/routers/{rid}/batches/{batch}")
+def hs_batch(rid: int, batch: str, request: Request):
+    _, r = _hs_ctx(request, rid)
+    rows = hotspot.batch_vouchers(rid, batch)
+    if not rows:
+        raise HTTPException(404, "Batch tidak ditemukan")
+    return {"vouchers": rows, "router_dns": r["hs_dns"], "brand": db.get_settings()["brand_name"]}
+
+
+@app.post("/api/hotspot/routers/{rid}/sync")
+def hs_sync(rid: int, request: Request):
+    _, r = _hs_ctx(request, rid)
+    return _hs_call(hotspot.sync_router, r)
+
+
+@app.get("/api/hotspot/sales")
+def hs_sales(request: Request, rid: str = "all", days: int = 30):
+    c = _ctx(request)
+    rows = db.q("SELECT id FROM routers WHERE hs_enabled=1")
+    ids = [r["id"] for r in rows]
+    if c["role"] == "client":
+        if not c["hotspot"]:
+            raise HTTPException(404, "Tidak ditemukan")
+        ids = [i for i in ids if i in (scope(request) or [])]
+    if rid != "all":
+        if not rid.isdigit() or int(rid) not in ids:
+            raise HTTPException(404, "Router tidak ditemukan")
+        ids = [int(rid)]
+    return hotspot.sales(ids, days)
+
+
+@app.get("/api/hotspot/routers/{rid}/loginpage")
+def hs_loginpage(rid: int, request: Request, title: str = "WiFi Voucher", subtitle: str = "Masukkan kode voucher Anda",
+                 color: str = "#2563eb", mode: str = "voucher", footer: str = ""):
+    _hs_ctx(request, rid)
+    return {"html": hotspot.login_html(title, subtitle, color, mode if mode in ("voucher", "userpass") else "voucher", footer)}
