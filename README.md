@@ -66,7 +66,7 @@ Menu **Hotspot** (admin, dan klien yang diberi izin) mengelola hotspot MikroTik 
 
 Klien bisa membuka portalnya di `nama.pantau.domainanda.com` tanpa membuka port di VPS.
 
-1. Di Cloudflare Zero Trust buat **Tunnel** (cloudflared), salin **token tunnel** ke `CF_TUNNEL_TOKEN` di `.env`, jalankan `docker compose --profile tunnel up -d`. Ubah port `monitor` menjadi `"127.0.0.1:8080:8080"` dan set `COOKIE_SECURE=1`.
+1. Di Cloudflare Zero Trust buat **Tunnel** (cloudflared), salin **token tunnel** ke `CF_TUNNEL_TOKEN` di `.env`, jalankan `docker compose -f docker-compose.yml -f docker-compose.tunnel.yml --profile tunnel up -d --build` (file tunnel terpisah, `docker-compose.yml` tidak perlu diubah). Ubah port `monitor` di `docker-compose.yml` menjadi `"127.0.0.1:8080:8080"` dan set `COOKIE_SECURE=1`.
 2. Buat **API token** (izin: Zone → DNS → Edit pada zone Anda, dan Account → Cloudflare Tunnel → Edit). Catat Account ID, Zone ID, dan Tunnel ID.
 3. Pantau → **Pengaturan → Cloudflare Tunnel**: isi token, ID-ID, dan domain dasar (mis. `pantau.domainanda.com`), centang aktif, **Simpan**, lalu **Tes Cloudflare** dan **Terapkan ingress tunnel** (mengatur `*.domain` dan `domain` menuju `http://monitor:8080`).
 4. Menu **Klien** → **Publish** → pilih subdomain. Pantau membuat DNS CNAME (proxied) ke tunnel. **Hentikan publish** atau hapus klien menghapus DNS-nya.

@@ -11,18 +11,3 @@ services:
     # Penting: container harus bisa menjangkau IP VPN router.
     # Jika VPN berjalan di host (WireGuard/OpenVPN/L2TP), jaringan bridge Docker default sudah
     # di-NAT lewat host sehingga biasanya cukup. Bila tidak, pakai: network_mode: host
-
-  # Cloudflare Tunnel (publish portal klien per subdomain). Aktifkan dengan:
-  #   docker compose --profile tunnel up -d
-  # Isi CF_TUNNEL_TOKEN di .env (token tunnel dari Cloudflare Zero Trust). Saat memakai tunnel,
-  # ubah port monitor di atas menjadi "127.0.0.1:8080:8080" agar web tidak terbuka langsung ke internet.
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: pantau-cloudflared
-    restart: unless-stopped
-    profiles: ["tunnel"]
-    command: tunnel --no-autoupdate run
-    environment:
-      - TUNNEL_TOKEN=${CF_TUNNEL_TOKEN}
-    depends_on:
-      - monitor

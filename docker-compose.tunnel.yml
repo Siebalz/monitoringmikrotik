@@ -1,0 +1,17 @@
+# Cloudflare Tunnel untuk publish portal klien (opsional). File ini TERPISAH agar docker-compose.yml Anda tidak berubah.
+# Jalankan:
+#   docker compose -f docker-compose.yml -f docker-compose.tunnel.yml --profile tunnel up -d --build
+# Isi CF_TUNNEL_TOKEN di .env (token tunnel dari Cloudflare Zero Trust).
+# Saat memakai tunnel, sebaiknya di docker-compose.yml ubah port monitor menjadi "127.0.0.1:8080:8080"
+# agar web tidak terbuka langsung ke internet.
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: pantau-cloudflared
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CF_TUNNEL_TOKEN}
+    depends_on:
+      - monitor
