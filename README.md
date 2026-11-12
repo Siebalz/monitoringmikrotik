@@ -45,6 +45,35 @@ Alur singkat: Klien → Tambah klien → pilih router → salin kredensial yang 
 > Karena klien login dari internet, jalankan di belakang HTTPS (Caddy/Nginx/Cloudflare Tunnel) lalu isi `COOKIE_SECURE=1` di `.env`. Password klien disimpan ter-hash (scrypt). Akun admin tetap dari `.env`.
 > Tes: `python tests/test_portal.py`
 
+## Hotspot / Mikhmon online
+
+Menu **Hotspot** (admin, dan klien yang diberi izin) mengelola hotspot MikroTik lewat RouterOS API:
+
+- **Voucher:** buat massal (maks 500) per profile, tipe *kode saja* (user = password) atau *user + password*, panjang/karakter/prefix, batas waktu pakai dan kuota. **Cetak** langsung dari browser (kartu 3 kolom), unduh **CSV**, atau salin. Batch tercatat dan bisa dicetak ulang.
+- **User:** daftar user hotspot + status online, cari, putuskan sesi, nonaktifkan/aktifkan, hapus.
+- **Profile:** kecepatan, perangkat per voucher, session/idle timeout, plus **harga** dan **masa aktif** (disimpan di Pantau).
+- **Laporan:** omzet, jumlah voucher terjual, stok, grafik per hari, rekap per profile (7/30/90/365 hari, bisa gabungan semua router).
+- **Halaman login:** generator `login.html` hotspot (kode voucher saja atau user+password, warna/judul sendiri) dengan pratinjau; unduh lalu unggah ke folder `hotspot` di router.
+
+**Menyiapkan satu router:** menu Hotspot → pilih router → **Pengaturan** → isi akun hotspot (policy `read,write,api,test`; perintah pembuatannya tampil di halaman itu) → **Tes koneksi & hak tulis** → centang aktif. Akun monitoring biasa (read-only) tidak bisa membuat voucher; itu sebabnya dipisah.
+
+**Cara kerja "terjual" dan masa aktif:** Pantau memeriksa router tiap ±1 menit (Pengaturan → Hotspot). Voucher dianggap terjual saat pertama terlihat dipakai (uptime/traffic > 0); masa aktif (validity) dihitung sejak saat itu, lalu user dihapus otomatis saat habis. Konsekuensinya: (1) bila Pantau tidak bisa menjangkau router, penghapusan tertunda sampai tersambung lagi (pakai *Batas waktu pakai*/kuota sebagai batas keras di router bila perlu); (2) voucher yang dihapus langsung dari Winbox sebelum dipakai ikut dihitung terjual — hapus lewat Pantau agar tidak dihitung.
+
+**Untuk klien (tanpa langganan/penagihan):** di menu **Klien**, centang *Izinkan menu Hotspot*. Klien hanya melihat dan menulis ke router yang tertaut ke akunnya dan sudah diaktifkan Hotspot-nya; akun router, IP, dan pengaturan tidak terlihat olehnya. Halaman Pengaturan hotspot, tes koneksi, dan Cloudflare tetap khusus admin.
+> Tes: `python tests/test_hotspot.py`
+
+## Publish otomatis lewat Cloudflare Tunnel (subdomain per klien)
+
+Klien bisa membuka portalnya di `nama.pantau.domainanda.com` tanpa membuka port di VPS.
+
+1. Di Cloudflare Zero Trust buat **Tunnel** (cloudflared), salin **token tunnel** ke `CF_TUNNEL_TOKEN` di `.env`, jalankan `docker compose --profile tunnel up -d`. Ubah port `monitor` menjadi `"127.0.0.1:8080:8080"` dan set `COOKIE_SECURE=1`.
+2. Buat **API token** (izin: Zone → DNS → Edit pada zone Anda, dan Account → Cloudflare Tunnel → Edit). Catat Account ID, Zone ID, dan Tunnel ID.
+3. Pantau → **Pengaturan → Cloudflare Tunnel**: isi token, ID-ID, dan domain dasar (mis. `pantau.domainanda.com`), centang aktif, **Simpan**, lalu **Tes Cloudflare** dan **Terapkan ingress tunnel** (mengatur `*.domain` dan `domain` menuju `http://monitor:8080`).
+4. Menu **Klien** → **Publish** → pilih subdomain. Pantau membuat DNS CNAME (proxied) ke tunnel. **Hentikan publish** atau hapus klien menghapus DNS-nya.
+
+Keamanan: di subdomain klien **hanya akun klien itu** yang bisa login (admin dan klien lain ditolak), nama brand mengikuti nama klien, dan batas percobaan login memakai IP asli pengunjung (`CF-Connecting-IP`). Panel admin sebaiknya diakses lewat alamat lain (IP/VPN atau domain terpisah), bukan di bawah `*.domain-dasar`. Token API disimpan terenkripsi.
+> Tes: `python tests/test_hotspot.py` (Cloudflare diuji dengan API palsu)
+
 ## Fitur VPN (digabung dari VPN Manager PHP)
 
 Menu **VPN** mengelola server MikroTik L2TP Anda lewat RouterOS API:
@@ -169,6 +198,8 @@ Polling 30 dtk: ±2.900 baris/router/hari untuk metrik (disimpan 60 hari) dan ±
 app/ros.py       klien RouterOS API (+ simulator DEMO)
 app/poller.py    polling paralel, hitung bps, mesin alert
 app/vpn.py       user VPN: PPP secret, NAT, script client
+app/hotspot.py   Mikhmon online: voucher, user/profile hotspot, laporan, login.html
+app/cloudflare.py publish portal klien lewat Cloudflare Tunnel + DNS
 app/telegram.py  kirim notifikasi + bot perintah
 app/main.py      REST API + login
 app/static/      dashboard (Chart.js & font dibundel, jalan offline)

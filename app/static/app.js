@@ -114,12 +114,13 @@ async function route() {
   if (timer) clearInterval(timer); if (liveTimer) { clearInterval(liveTimer); liveTimer = null; } refresh = null; destroyCharts();
   const h = location.hash.replace(/^#/, '') || '/';
   const m = h.match(/^\/router\/(\d+)/);
-  if (S.role === 'client' && !(m || ['/', '/latency', '/events', '/account'].includes(h))) { location.hash = '#/'; return; }
+  if (S.role === 'client' && !(m || ['/', '/latency', '/events', '/account'].includes(h) || (h === '/hotspot' && S.hotspot))) { location.hash = '#/'; return; }
   try {
     if (m) { setNav('routers'); await pageDetail(+m[1]); }
     else if (h === '/routers') { setNav('routers'); await pageRouters(); }
     else if (h === '/latency') { setNav('latency'); await pageLatency(); }
     else if (h === '/vpn') { setNav('vpn'); await pageVpn(); }
+    else if (h === '/hotspot') { setNav('hotspot'); await pageHotspot(); }
     else if (h === '/events') { setNav('events'); await pageEvents(); }
     else if (h === '/users') { setNav('users'); await pageUsers(); }
     else if (h === '/account') { setNav('account'); await pageAccount(); }
@@ -489,9 +490,23 @@ async function pageSettings() {
     <div style="display:grid;gap:8px;align-content:start"><label class="chk"><input type="checkbox" name="vpn_watchdog" ${s.vpn_watchdog ? 'checked' : ''}> Watchdog auto-reconnect di script client</label></div>
     ${fld('vpn_watchdog_interval', 'Interval cek watchdog (detik)', 'Minimal 10')}
     <label>Sumber akses API monitoring<input name="vpn_monitor_address" value="${esc(s.vpn_monitor_address)}" class="mono" placeholder="kosong = subnet VPN /24"><span class="hint">Dipakai di script client (<span class="mono">address=</span>)</span></label></div></section>
+  <section class="panel"><header><h2>Hotspot (Mikhmon online)</h2></header><div class="pad" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
+    ${fld('hs_sync_interval', 'Interval sinkron voucher (detik)', 'Minimal 30. Dipakai untuk mendeteksi voucher terpakai dan menghapus yang kedaluwarsa.')}</div></section>
+  <section class="panel"><header><h2>Cloudflare Tunnel (publish portal klien)</h2></header><div class="pad" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px">
+    <div style="display:grid;gap:8px;align-content:start"><label class="chk"><input type="checkbox" name="cf_enabled" ${s.cf_enabled ? 'checked' : ''}> Aktifkan publish via Cloudflare</label></div>
+    <label>API token<input name="cf_token" type="password" class="mono" autocomplete="new-password" placeholder="${s.cf_token_set ? '•••• tersimpan (kosongkan bila tidak diubah)' : 'token dengan izin DNS Edit + Cloudflare Tunnel Edit'}"></label>
+    <label>Account ID<input name="cf_account_id" class="mono" value="${esc(s.cf_account_id)}"></label>
+    <label>Zone ID<input name="cf_zone_id" class="mono" value="${esc(s.cf_zone_id)}"></label>
+    <label>Tunnel ID<input name="cf_tunnel_id" class="mono" value="${esc(s.cf_tunnel_id)}"></label>
+    <label>Domain dasar<input name="cf_base_domain" class="mono" value="${esc(s.cf_base_domain)}" placeholder="pantau.domainanda.com"><span class="hint">Klien: <span class="mono">nama.domain-dasar</span></span></label>
+    <label>Alamat web Pantau (dari cloudflared)<input name="cf_service" class="mono" value="${esc(s.cf_service)}"></label>
+    <div class="row" style="grid-column:1/-1"><button type="button" class="btn" id="cfT">Tes Cloudflare</button><button type="button" class="btn" id="cfA">Terapkan ingress tunnel</button><span id="cfR" class="hint"></span></div>
+    <p class="hint" style="grid-column:1/-1;margin:0">Simpan pengaturan dulu sebelum menekan tombol tes. Buat tunnel di Cloudflare Zero Trust (jenis cloudflared), jalankan container <span class="mono">cloudflared</span> dengan token tunnel (lihat README), lalu <b>Terapkan ingress</b>. Selanjutnya tiap klien dipublish dari menu Klien. Login admin ditolak di subdomain klien.</p></div></section>
   <section class="panel"><header><h2>Polling & penyimpanan</h2></header><div class="pad" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
     ${fld('poll_interval', 'Interval polling (detik)', 'Minimal 10')}${fld('metrics_retention_days', 'Simpan metrik (hari)')}${fld('iface_retention_days', 'Simpan traffic interface (hari)')}</div></section></form>`;
   const collect = () => { const o = {}; $$('#sf input, #sf select, #sf textarea').forEach(i => { if (i.name) o[i.name] = i.type === 'checkbox' ? i.checked : i.value; }); return o; };
+  const cfRun = async (path, label) => { $('#cfR').textContent = label + '…'; try { const j = await api(path, { method: 'POST' }); $('#cfR').textContent = path.endsWith('test') ? `OK · zone ${j.zone} · tunnel ${j.tunnel} (${j.status})` : 'Ingress diterapkan ke tunnel'; } catch (x) { $('#cfR').textContent = 'Gagal: ' + x.message; } };
+  $('#cfT').onclick = () => cfRun('/cloudflare/test', 'Menguji'); $('#cfA').onclick = () => cfRun('/cloudflare/apply', 'Menerapkan');
   $('#save').onclick = async () => { try { await api('/settings', { method: 'PUT', body: collect() }); toast('Pengaturan disimpan', 'ok'); route(); } catch (e) { toast(e.message, 'bad'); } };
   $('#tgTest').onclick = async () => { try { await api('/settings', { method: 'PUT', body: collect() }); const j = await api('/telegram/test', { method: 'POST' }); toast(j.ok ? 'Pesan tes terkirim ke Telegram' : 'Gagal: ' + j.error, j.ok ? 'ok' : 'bad'); } catch (e) { toast(e.message, 'bad'); } };
   const c = $('#tgClear'); if (c) c.onclick = async () => { if (confirm('Hapus token bot?')) { await api('/settings', { method: 'PUT', body: { tg_token_clear: true } }); route(); } };
@@ -716,6 +731,7 @@ function openUserForm(u, routers, done) {
     <label>Chat ID Telegram<input name="tg_chat_ids" class="mono" value="${esc(u.tg_chat_ids || '')}" placeholder="boleh lebih dari satu, pisahkan koma"><span class="hint">Klien kirim <span class="mono">/id</span> ke bot untuk mengetahuinya. Klien juga bisa mengisi sendiri di menu Akun saya.</span></label>
     <label>Notifikasi<select name="notify">${Object.entries(NOTIFY_LABEL).map(([k, v]) => `<option value="${k}" ${u.notify === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
     <label class="chk"><input type="checkbox" name="enabled" ${u.enabled ? 'checked' : ''}> Akun aktif</label>
+    <label class="chk"><input type="checkbox" name="hotspot_access" ${u.hotspot_access ? 'checked' : ''}> Izinkan menu Hotspot (voucher, user, profile, laporan) untuk router miliknya <span class="hint" style="margin-left:6px">router harus diaktifkan Hotspot-nya dulu di menu Hotspot → Pengaturan</span></label>
     <div class="full"><div style="font-weight:600;margin-bottom:6px">Router yang boleh dilihat <span class="hint" id="ucnt"></span></div>
       <div style="max-height:240px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:6px 10px">${Object.entries(groups).map(([g, rs]) => `<div class="hint" style="margin:8px 0 2px">${esc(g)}</div>${rs.map(r => `<label class="chk" style="padding:3px 0"><input type="checkbox" name="rt" value="${r.id}" ${u.router_ids.includes(r.id) ? 'checked' : ''}> ${esc(r.name)}</label>`).join('')}`).join('') || '<div class="empty">Belum ada router.</div>'}</div></div>
   </div><footer>${e ? '<button type="button" class="btn danger" id="uDel" style="margin-right:auto">Hapus</button>' : ''}<button type="button" class="btn" id="uC">Batal</button><button class="btn primary" type="submit">Simpan</button></footer></form>`);
@@ -725,7 +741,7 @@ function openUserForm(u, routers, done) {
   f.onsubmit = async ev => {
     ev.preventDefault();
     const body = { username: f.username.value.trim(), display_name: f.display_name.value, password: f.password.value || null, tg_chat_ids: f.tg_chat_ids.value,
-      notify: f.notify.value, enabled: f.enabled.checked, router_ids: $$('[name=rt]:checked', f).map(x => +x.value) };
+      notify: f.notify.value, enabled: f.enabled.checked, hotspot_access: f.hotspot_access.checked, router_ids: $$('[name=rt]:checked', f).map(x => +x.value) };
     try {
       const j = await api(e ? '/users/' + u.id : '/users', { method: e ? 'PUT' : 'POST', body });
       closeModal(); done();
@@ -734,6 +750,15 @@ function openUserForm(u, routers, done) {
     } catch (x) { toast(x.message, 'bad'); }
   };
 }
+function openPublish(u, done) {
+  openModal(`<form class="sheet" id="pbf"><header><h2>Publish portal: ${esc(u.display_name || u.username)}</h2><button type="button" class="btn ghost sm" id="pbX">✕</button></header><div class="body">
+    <label class="full">Subdomain<input name="sub" class="mono" value="${esc(u.subdomain || u.username.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 30))}" required maxlength="30" pattern="[a-z0-9]([a-z0-9\-]*[a-z0-9])?"><span class="hint">Membuat DNS Cloudflare untuk tunnel. Klien login di alamat ini dan hanya akun klien itu yang bisa masuk. Butuh Cloudflare aktif di Pengaturan.</span></label>
+    ${u.url ? `<div class="full dim">Sekarang: <a href="${esc(u.url)}" target="_blank" rel="noopener">${esc(u.url)}</a></div>` : ''}
+  </div><footer>${u.subdomain ? '<button type="button" class="btn danger" id="pbD" style="margin-right:auto">Hentikan publish</button>' : ''}<button type="button" class="btn" id="pbC">Batal</button><button class="btn primary" type="submit">${u.subdomain ? 'Ubah' : 'Publish'}</button></footer></form>`);
+  $('#pbX').onclick = $('#pbC').onclick = closeModal;
+  if (u.subdomain) $('#pbD').onclick = async () => { if (!confirm('Hentikan publish dan hapus DNS-nya?')) return; try { await api(`/users/${u.id}/publish`, { method: 'DELETE' }); closeModal(); toast('Publish dihentikan', 'ok'); done(); } catch (x) { toast(x.message, 'bad'); } };
+  $('#pbf').onsubmit = async ev => { ev.preventDefault(); try { const j = await api(`/users/${u.id}/publish`, { method: 'POST', body: { subdomain: ev.target.sub.value.trim().toLowerCase() } }); closeModal(); toast('Dipublish: ' + j.url, 'ok'); done(); } catch (x) { toast(x.message, 'bad'); } };
+}
 async function pageUsers() {
   $('#main').innerHTML = `<div class="page-head"><div><h1>Klien</h1><div class="sub">Akun portal untuk pelanggan: mereka hanya melihat router miliknya (baca-saja) dan menerima notifikasi Telegram.</div></div><div class="row"><button class="btn primary" id="uAdd">Tambah klien</button></div></div>
   <section class="panel"><div class="tbl-wrap"><table class="tbl" id="uT"></table></div></section>`;
@@ -741,13 +766,15 @@ async function pageUsers() {
     const [us, rs] = await Promise.all([api('/users'), api('/routers')]);
     const rn = Object.fromEntries(rs.map(r => [r.id, r.name]));
     $('#uAdd').onclick = () => openUserForm(null, rs, load);
-    $('#uT').innerHTML = `<thead><tr><th>Klien</th><th>Router</th><th>Telegram</th><th>Terakhir masuk</th><th>Status</th><th></th></tr></thead><tbody>${us.map(u => `<tr>
+    $('#uT').innerHTML = `<thead><tr><th>Klien</th><th>Router</th><th>Telegram</th><th>Portal</th><th>Terakhir masuk</th><th>Status</th><th></th></tr></thead><tbody>${us.map(u => `<tr>
       <td><b>${esc(u.display_name || u.username)}</b><div class="dim mono" style="font-size:12px">${esc(u.username)}</div></td>
       <td style="max-width:260px">${u.router_ids.map(i => `<span class="chip">${esc(rn[i] || '#' + i)}</span>`).join('') || '<span class="dim">–</span>'}</td>
       <td>${u.tg_chat_ids ? `<span class="pill ok">Chat ID terisi</span><div class="dim" style="font-size:12px">${esc(NOTIFY_LABEL[u.notify])}</div>` : '<span class="pill">Belum diisi</span>'}</td>
+      <td style="font-size:12px">${u.url ? `<a href="${esc(u.url)}" target="_blank" rel="noopener">${esc(u.url.replace('https://', ''))}</a>` : '<span class="dim">–</span>'}${u.hotspot_access ? '<div><span class="pill ok">Hotspot</span></div>' : ''}</td>
       <td class="dim">${u.last_login ? ago(u.last_login) : 'belum pernah'}</td>
       <td>${u.enabled ? '<span class="pill ok">Aktif</span>' : '<span class="pill warn">Nonaktif</span>'}</td>
-      <td class="r" style="white-space:nowrap">${u.tg_chat_ids ? `<button class="btn sm" data-t="${u.id}">Tes notifikasi</button> ` : ''}<button class="btn sm" data-e="${u.id}">Edit</button></td></tr>`).join('') || '<tr><td colspan="6" class="empty">Belum ada akun klien.</td></tr>'}</tbody>`;
+      <td class="r" style="white-space:nowrap">${u.tg_chat_ids ? `<button class="btn sm" data-t="${u.id}">Tes notifikasi</button> ` : ''}<button class="btn sm" data-pub="${u.id}">${u.subdomain ? 'Domain' : 'Publish'}</button> <button class="btn sm" data-e="${u.id}">Edit</button></td></tr>`).join('') || '<tr><td colspan="7" class="empty">Belum ada akun klien.</td></tr>'}</tbody>`;
+    $$('[data-pub]').forEach(b => b.onclick = () => openPublish(us.find(x => x.id === +b.dataset.pub), load));
     $$('[data-e]').forEach(b => b.onclick = () => openUserForm(us.find(x => x.id === +b.dataset.e), rs, load));
     $$('[data-t]').forEach(b => b.onclick = async () => { b.disabled = true; try { const j = await api(`/users/${b.dataset.t}/test-notify`, { method: 'POST' }); toast(j.ok ? 'Terkirim ke Telegram klien' : 'Gagal: ' + (j.error || ''), j.ok ? 'ok' : 'bad'); } catch (x) { toast(x.message, 'bad'); } finally { b.disabled = false; } });
   };
@@ -792,7 +819,7 @@ function applyBrand(me) {
 async function start() {
   let me;
   try { me = await api('/me'); applyBrand(me); if (!me.user) return showLogin(); } catch (e) { return showLogin(); }
-  S.role = me.role || 'admin'; document.body.classList.toggle('role-client', S.role === 'client');
+  S.role = me.role || 'admin'; S.hotspot = !!me.hotspot; document.body.classList.toggle('role-client', S.role === 'client'); document.body.classList.toggle('has-hs', S.hotspot);
   $('#login').hidden = true; $('#app').hidden = false; route();
 }
 start();

@@ -13,7 +13,9 @@ class FakeRouter:
     def __init__(self):
         self.deny = False
         self.ids = itertools.count(1)
-        self.t = {"/ppp/secret": [], "/ip/firewall/nat": [], "/ppp/active": [], "/ip/hotspot/active": [], "/interface": [], "/ip/route": [{".id": "*R1", "dst-address": "0.0.0.0/0", "gateway": "192.168.101.1", "active": "true", "disabled": "false", "distance": "1"}], "/ppp/profile": [{".id": "*p1", "name": "default"}]}
+        self.t = {"/ppp/secret": [], "/ip/firewall/nat": [], "/ppp/active": [], "/ip/hotspot/active": [], "/interface": [], "/ip/route": [{".id": "*R1", "dst-address": "0.0.0.0/0", "gateway": "192.168.101.1", "active": "true", "disabled": "false", "distance": "1"}], "/ppp/profile": [{".id": "*p1", "name": "default"}],
+                  "/ip/hotspot/user": [], "/ip/hotspot/user/profile": [{".id": "*hp1", "name": "default", "shared-users": "1"}], "/ip/hotspot": [{".id": "*hs1", "name": "hotspot1"}]}
+        self.ro = False       # akun read-only: tulis ke hotspot ditolak
         self.srv = socket.socket(); self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.srv.bind(("127.0.0.1", 0)); self.srv.listen(8); self.port = self.srv.getsockname()[1]
         threading.Thread(target=self.loop, daemon=True).start()
@@ -78,6 +80,10 @@ class FakeRouter:
         for base in self.t:
             if cmd.startswith(base + "/"):
                 op, rows = cmd[len(base) + 1:], self.t[base]
+                if "/" in op:
+                    continue                      # milik base yang lebih panjang (mis. /ip/hotspot/user/profile)
+                if self.ro and base.startswith("/ip/hotspot") and op in ("add", "remove", "set", "enable", "disable"):
+                    return {"trap": "not enough permissions (9)"}
                 if op == "print":
                     sel = rows
                     for q in qs:
@@ -86,10 +92,17 @@ class FakeRouter:
                 if op == "add":
                     if base == "/ppp/secret" and any(r["name"] == a["name"] for r in rows): return {"trap": "failure: already have such entry"}
                     if a.get("fail-me"): return {"trap": "boom"}
+                    if base in ("/ip/hotspot/user", "/ip/hotspot/user/profile") and any(r["name"] == a["name"] for r in rows): return {"trap": "failure: already have such entry"}
+                    if base == "/ip/hotspot/user" and a.get("name", "").startswith("boom"): return {"trap": "boom"}
                     r = {".id": f"*{next(self.ids):X}", **a}; rows.append(r)
+                    if base == "/ip/hotspot/user": r.update({"uptime": "0s", "bytes-in": "0", "bytes-out": "0", "disabled": "false"})
                     if base == "/ppp/secret": r["disabled"] = "false"
                     return {}
                 if op == "remove": self.t[base][:] = [r for r in rows if r[".id"] != a[".id"]]; return {}
+                if op == "set":
+                    for r in rows:
+                        if r[".id"] == a[".id"]: r.update({k: v for k, v in a.items() if k != ".id"})
+                    return {}
                 if op in ("disable", "enable"):
                     for r in rows:
                         if r[".id"] == a[".id"]: r["disabled"] = "true" if op == "disable" else "false"
